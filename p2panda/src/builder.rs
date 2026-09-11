@@ -9,6 +9,7 @@ use p2panda_net::gossip::GossipConfig;
 use p2panda_net::iroh_endpoint::{EndpointAddr, QuicTransportConfig, RelayUrl};
 use p2panda_net::utils::from_verifying_key;
 use p2panda_net::{NetworkId, NodeId};
+use p2panda_spaces::Config as SpacesConfig;
 use p2panda_store::SqliteStore;
 use p2panda_store::sqlite::{SqlitePool, SqliteStoreBuilder};
 
@@ -270,6 +271,16 @@ impl NodeBuilder {
     /// If left unset, the previous hard-coded 5s / 10s default is used.
     pub fn quic_transport_config(mut self, config: QuicTransportConfig) -> Self {
         self.config.network.iroh.quic_transport_config = Some(config);
+        self
+    }
+
+    /// Defines custom spaces configuration parameters.
+    ///
+    /// This allows fine-tuning of the pre-key lifetime and rotation window used for a space
+    /// member's own long-term key bundle. If left unset, defaults to `SpacesConfig::default()`
+    /// (90 day pre-key lifetime, 60 day rotate-after).
+    pub fn spaces_config(mut self, config: SpacesConfig) -> Self {
+        self.config.spaces = config;
         self
     }
 

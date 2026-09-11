@@ -273,6 +273,8 @@ pub use p2panda_net::iroh_endpoint::{EndpointAddr, QuicTransportConfig, RelayUrl
 #[doc(no_inline)]
 pub use p2panda_net::{NetworkId, NodeId};
 #[doc(no_inline)]
+pub use p2panda_spaces::Config as SpacesConfig;
+#[doc(no_inline)]
 pub use p2panda_spaces::SpaceEvent;
 
 pub use builder::NodeBuilder;

@@ -122,8 +122,7 @@ impl Node {
             forge.clone(),
             credentials.clone(),
             store.clone(),
-            // TODO: Expose -spaces configuration to public API.
-            SpacesConfig::default(),
+            config.spaces.clone(),
         )?;
 
         // Prepare manager which orchestrates processing of incoming operations.
@@ -866,6 +865,7 @@ pub enum AckPolicy {
 pub(crate) struct Config {
     pub ack_policy: AckPolicy,
     pub network: NetworkConfig,
+    pub spaces: SpacesConfig,
 }
 
 /// Error occurred when spawning network or store processes.
