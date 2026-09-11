@@ -3,6 +3,7 @@
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use p2panda_net::addrs::{TransportAddress, TrustedTransportInfo};
+use p2panda_net::connection_authoriser::ConnectionAuthoriser;
 use p2panda_net::discovery::DiscoveryConfig;
 use p2panda_net::gossip::GossipConfig;
 use p2panda_net::iroh_endpoint::{EndpointAddr, RelayUrl};
@@ -23,6 +24,7 @@ pub struct NodeBuilder {
     credentials: Option<Credentials>,
     config: Config,
     store_options: StoreBuilderOptions,
+    connection_authoriser: Option<ConnectionAuthoriser>,
 }
 
 impl NodeBuilder {
@@ -32,6 +34,7 @@ impl NodeBuilder {
             credentials: None,
             config: Config::default(),
             store_options: StoreBuilderOptions::default(),
+            connection_authoriser: None,
         }
     }
 
@@ -257,6 +260,22 @@ impl NodeBuilder {
         self
     }
 
+    /// Sets a pre-configured `ConnectionAuthoriser` to govern which peers may open connections
+    /// to this node.
+    ///
+    /// The given authoriser is installed on the endpoint's connection hooks before the endpoint
+    /// starts accepting connections, closing the window in which a freshly spawned node would
+    /// otherwise default to permissive-with-empty-allowlist. Configure the authoriser's mode and
+    /// allow/block lists (e.g. via `ConnectionAuthoriser::restrictive()`/`.allow()`/
+    /// `.topic_allow()`) before passing it here.
+    ///
+    /// If left unset, a new permissive authoriser is created at spawn time, matching the
+    /// existing default behaviour.
+    pub fn connection_authoriser(mut self, authoriser: ConnectionAuthoriser) -> Self {
+        self.connection_authoriser = Some(authoriser);
+        self
+    }
+
     /// Spawns the `Node`.
     pub async fn spawn(self) -> Result<Node, SpawnError> {
         let credentials = self.credentials.unwrap_or_default();
@@ -275,7 +294,7 @@ impl NodeBuilder {
             StoreBuilderOptions::Pool(pool) => SqliteStore::from_pool(pool),
         };
 
-        Node::spawn_inner(self.config, store, credentials).await
+        Node::spawn_inner(self.config, store, credentials, self.connection_authoriser).await
     }
 }
 

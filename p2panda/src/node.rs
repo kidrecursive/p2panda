@@ -86,18 +86,29 @@ impl Node {
         // functionality of p2panda to only work on local-area networks.
         let config = Config::default();
 
-        Node::spawn_inner(config, store, credentials).await
+        Node::spawn_inner(config, store, credentials, None).await
     }
 
     pub(crate) async fn spawn_inner(
         config: Config,
         store: SqliteStore,
         credentials: Credentials,
+        connection_authoriser: Option<ConnectionAuthoriser>,
     ) -> Result<Self, SpawnError> {
         let forge = OperationForge::new(credentials.clone(), store.clone());
 
-        let connection_authoriser = ConnectionAuthoriser::new();
-        connection_authoriser.permissive().await;
+        let connection_authoriser = match connection_authoriser {
+            // A caller-supplied authoriser is used as-is (already configured via
+            // `restrictive()`/`allow()`/`topic_allow()`), so it governs connections from the
+            // moment the endpoint starts accepting them.
+            Some(connection_authoriser) => connection_authoriser,
+            // Unchanged default: a fresh, permissive authoriser.
+            None => {
+                let connection_authoriser = ConnectionAuthoriser::new();
+                connection_authoriser.permissive().await;
+                connection_authoriser
+            }
+        };
 
         let network = Network::spawn(
             config.network.clone(),

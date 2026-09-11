@@ -53,4 +53,4 @@ mock_instant = { workspace = true }
 p2panda = { path = ".", features = ["test_utils"] }
 p2panda-core = { workspace = true, default-features = true, features = ["test_utils"] }
 p2panda-store = { workspace = true, default-features = true, features = ["test_utils"] }
-tokio = { workspace = true, default-features = true, features = ["macros", "rt"] }
+tokio = { workspace = true, default-features = true, features = ["macros", "rt", "time"] }
