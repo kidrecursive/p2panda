@@ -1360,3 +1360,32 @@ mod connection_authorisation {
         }
     }
 }
+
+/// `Node::has_space` (square-tower fork addition, D3-i): detects an existing space without
+/// materialising it (no stream opened, no error on a truly unknown space -- unlike probing via
+/// `space(id)` and inspecting `Space::members()`, which errors and tears down that topic's
+/// just-opened stream tasks when the space doesn't exist yet).
+mod has_space {
+    use p2panda::Topic;
+
+    use super::{SecretData, spawn_node};
+
+    #[tokio::test]
+    async fn detects_an_existing_space_without_materialising_it() {
+        let network_id = Topic::random().into();
+        let panda = spawn_node(network_id).await;
+        let topic = Topic::random();
+
+        assert!(
+            !panda.has_space(topic).await.unwrap(),
+            "a space nobody created yet must report as absent"
+        );
+
+        let (_space, _rx) = panda.create_space::<SecretData>(topic).await.unwrap();
+
+        assert!(
+            panda.has_space(topic).await.unwrap(),
+            "the just-created space must now report as present"
+        );
+    }
+}

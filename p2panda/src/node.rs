@@ -736,6 +736,27 @@ impl Node {
         Ok((space, rx))
     }
 
+    /// Returns whether a space with `space_id` already exists in this node's local store.
+    ///
+    /// Unlike [`Node::space`]/[`Node::space_from`], this never materialises a `Space` handle,
+    /// opens a stream, or associates any log with the space topic -- it only asks the spaces
+    /// manager whether the space is already known (`SpacesManager::space`, itself a lightweight
+    /// store lookup: `SqliteSpacesStore::has_space`). This lets a caller decide between
+    /// [`Node::create_space`] (nothing known yet -- first-ever boot as this space's owner) and
+    /// [`Node::space`]/[`Node::space_from`] (resume -- e.g. after a process restart against the
+    /// same database) *before* calling either, without the side effects of probing via
+    /// `space(id)` and inspecting `Space::members()`: on a truly unknown space that probe errors
+    /// (`SpaceError::UnknownSpace`) and, as a side effect, tears down the space topic's
+    /// just-opened stream tasks, so a subsequent `create_space` call on the same topic then also
+    /// fails.
+    ///
+    /// square-tower fork addition (`square-tower/main`, D3-i in the downstream project's
+    /// `decisions.md`); upstream PR draft in that project's `docs/upstream/p2panda-has-space.md`.
+    pub async fn has_space(&self, space_id: impl Into<SpaceId>) -> Result<bool, HasSpaceError> {
+        let space_id = space_id.into();
+        Ok(self.spaces_manager.space(space_id).await?.is_some())
+    }
+
     /// Returns the node identifier (public key).
     pub fn id(&self) -> NodeId {
         self.forge.verifying_key()
@@ -907,4 +928,12 @@ pub enum CreateSpaceError {
 
     #[error("couldn't send event due to broken app channel")]
     AppSend,
+}
+
+/// Errors which can occur when checking whether a space already exists locally
+/// ([`Node::has_space`]). square-tower fork addition (D3-i).
+#[derive(Debug, Error)]
+pub enum HasSpaceError {
+    #[error(transparent)]
+    Manager(#[from] SpacesManagerError),
 }
