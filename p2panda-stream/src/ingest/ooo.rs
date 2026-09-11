@@ -171,7 +171,25 @@ where
                     //
                     // => Return [2]
                     // ```
-                    OooResult::InOrder(operation)
+                    //
+                    // M4-05: this operation itself was never out-of-order, so it was never
+                    // pushed into the buffer -- but it may be the missing predecessor of a chain
+                    // that *is* sitting there (e.g. [4],[5] arrived before [3], are buffered, and
+                    // now [3] arrives directly in-order). Check for and release such a chain
+                    // instead of only ever checking the buffer from `push_and_pop_from` (which
+                    // this operation never goes through, since it isn't itself out-of-order):
+                    // without this, [4]/[5] would stay buffered until *some other, later*
+                    // out-of-order arrival happened to re-trigger a buffer check, which is not
+                    // guaranteed to ever happen.
+                    let freed = self.pop_chain_after(operation.hash, log_id).await;
+                    if freed.is_empty() {
+                        OooResult::InOrder(operation)
+                    } else {
+                        let mut ordered = Vec::with_capacity(1 + freed.len());
+                        ordered.push(operation.clone());
+                        ordered.extend(freed);
+                        OooResult::Ordered(ordered)
+                    }
                 } else {
                     // Operation is _after_ the log frontier and thus out-of-order / can't be
                     // appended to log yet.
@@ -210,6 +228,15 @@ where
                 self.push_and_pop_from(operation, None, log_id).await
             }
         }
+    }
+
+    /// Pops (without pushing anything new) any chain of buffered operations whose first item's
+    /// backlink is `after` -- i.e. releases operations that were waiting on exactly this operation
+    /// (M4-05). Used when an operation arrives directly in-order (never itself buffered) but may
+    /// still be the missing predecessor for something that *is* sitting in the buffer.
+    async fn pop_chain_after(&self, after: Hash, log_id: &L) -> Vec<Operation<E>> {
+        let mut buffer = self.buffer.lock().await;
+        buffer.pop_from(Some(after), log_id.clone())
     }
 
     async fn push_and_pop_from<'a>(

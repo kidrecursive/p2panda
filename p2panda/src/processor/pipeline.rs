@@ -13,7 +13,7 @@ use p2panda_store::SqliteStore;
 use p2panda_store::spaces::SqliteSpacesStore;
 use p2panda_stream::StreamLayerExt;
 use p2panda_stream::hooks::{Hooks, ProcessorHooksList};
-use p2panda_stream::ingest::Ingest;
+use p2panda_stream::ingest::{Ingest, IngestResult};
 use p2panda_stream::log_prune::LogPrune;
 use p2panda_stream::orderer::{Orderer, OrdererResult};
 use serde::{Deserialize, Serialize};
@@ -219,8 +219,20 @@ where
                         .layer(ingest)
                         .map(|result| match result {
                             Ok((mut event, result)) => {
+                                // M4-05: `OutOfOrder` (buffered, not yet inserted) and `Outdated`
+                                // (before the log's prune point, ignored) must not be allowed to
+                                // have any effect on later processors -- the operation isn't
+                                // durably stored yet (or ever will be). Mirrors exactly how a
+                                // causally-`Pending` orderer result is `noop()`'d below; the event
+                                // still needs to flow through the whole pipeline once (so its
+                                // waiting task gets marked done, see this file's own docs on task
+                                // tracking), it just must cause nothing downstream.
+                                let suppress = matches!(
+                                    result,
+                                    IngestResult::OutOfOrder | IngestResult::Outdated
+                                );
                                 event.ingest = ProcessorStatus::Completed(result);
-                                event
+                                if suppress { event.noop() } else { event }
                             }
                             Err((mut event, err)) => {
                                 event.ingest = ProcessorStatus::Failed(err);

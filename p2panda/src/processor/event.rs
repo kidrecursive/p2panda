@@ -149,10 +149,22 @@ where
     /// until it'll be released by another event.
     ///
     /// Buffering usually takes place when an event arrives out-of-order.
+    ///
+    /// M4-05: this now also covers the log-integrity ("ingest") ordering stage, not just the
+    /// causal-dependency ("orderer") stage -- an operation can arrive out-of-order with respect
+    /// to its own log's strict seq-num/backlink chain (buffered by `Ingest`'s `OooBuffer`) before
+    /// it ever reaches the orderer at all. Both cases mean the same thing to every caller of this
+    /// method: the operation is not yet durably usable and must not be surfaced to the
+    /// application or fed to later processors. `IngestResult::Outdated` (before a prune point) is
+    /// included here too, for the same reason `noop()` treats it identically to `OutOfOrder` in
+    /// `crate::processor::pipeline` -- neither should ever reach the application.
     pub fn is_pending(&self) -> bool {
         matches!(
             self.orderer,
             ProcessorStatus::Completed(OrdererResult::Pending)
+        ) || matches!(
+            self.ingest,
+            ProcessorStatus::Completed(IngestResult::OutOfOrder | IngestResult::Outdated)
         )
     }
 

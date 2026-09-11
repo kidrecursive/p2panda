@@ -180,6 +180,7 @@ mod tests {
     use crate::Processor;
     use crate::groups::{GroupsArgs, GroupsOperation};
     use crate::ingest::{Ingest, IngestArgs};
+    use crate::orderer::OrdererMetadata;
 
     type LogId = usize;
 
@@ -257,6 +258,20 @@ mod tests {
     impl Borrow<GroupsArgs<()>> for Event {
         fn borrow(&self) -> &GroupsArgs<()> {
             &self.groups_args
+        }
+    }
+
+    // M4-05: `Event` here is fully self-describing from its own `Operation<TestExtensions>` (see
+    // `From<Operation<TestExtensions>> for Event` above, which every field derives from), so no
+    // external metadata is needed to reconstruct one -- unlike the production
+    // `p2panda::processor::Event`, which needs an externally-supplied `topic`.
+    impl OrdererMetadata<TestExtensions> for Event {
+        type Metadata = ();
+
+        fn metadata(&self) -> Self::Metadata {}
+
+        fn from_operation(operation: Operation<TestExtensions>, _meta: Self::Metadata) -> Self {
+            Event::from(operation)
         }
     }
 
