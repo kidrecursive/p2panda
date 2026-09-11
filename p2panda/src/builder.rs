@@ -6,7 +6,7 @@ use p2panda_net::addrs::{TransportAddress, TrustedTransportInfo};
 use p2panda_net::connection_authoriser::ConnectionAuthoriser;
 use p2panda_net::discovery::DiscoveryConfig;
 use p2panda_net::gossip::GossipConfig;
-use p2panda_net::iroh_endpoint::{EndpointAddr, RelayUrl};
+use p2panda_net::iroh_endpoint::{EndpointAddr, QuicTransportConfig, RelayUrl};
 use p2panda_net::utils::from_verifying_key;
 use p2panda_net::{NetworkId, NodeId};
 use p2panda_store::SqliteStore;
@@ -257,6 +257,19 @@ impl NodeBuilder {
     /// maximum message size for broadcast. The default maximum message size is 4096 bytes.
     pub fn gossip_config(mut self, config: GossipConfig) -> Self {
         self.config.network.gossip = config;
+        self
+    }
+
+    /// Sets the default QUIC transport parameters applied to the endpoint at bind time.
+    ///
+    /// Replaces the endpoint's hard-coded 5s keep-alive interval / 10s max idle timeout default.
+    /// This only affects the endpoint-wide default: sync sessions always dial with plain
+    /// `connect()`, never `connect_with_config()`, so this is the only transport-config knob that
+    /// actually governs sync traffic between nodes.
+    ///
+    /// If left unset, the previous hard-coded 5s / 10s default is used.
+    pub fn quic_transport_config(mut self, config: QuicTransportConfig) -> Self {
+        self.config.network.iroh.quic_transport_config = Some(config);
         self
     }
 

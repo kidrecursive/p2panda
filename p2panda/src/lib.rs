@@ -269,7 +269,7 @@ pub use p2panda_core::{Cursor, Hash, SigningKey, Topic, VerifyingKey};
 #[doc(no_inline)]
 pub use p2panda_net::connection_authoriser::ConnectionAuthoriser;
 #[doc(no_inline)]
-pub use p2panda_net::iroh_endpoint::{EndpointAddr, RelayUrl};
+pub use p2panda_net::iroh_endpoint::{EndpointAddr, QuicTransportConfig, RelayUrl};
 #[doc(no_inline)]
 pub use p2panda_net::{NetworkId, NodeId};
 #[doc(no_inline)]

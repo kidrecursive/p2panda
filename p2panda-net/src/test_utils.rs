@@ -133,6 +133,7 @@ pub fn test_args_from_seed(seed: [u8; 32]) -> ApplicationArguments {
             bind_port_v4: rng.random_range(49152..65535),
             bind_ip_v6: Ipv6Addr::LOCALHOST,
             bind_port_v6: rng.random_range(49152..65535),
+            quic_transport_config: None,
         })
         .with_rng(rng)
         .with_mdns_mode(MdnsDiscoveryMode::Passive)
@@ -144,7 +145,20 @@ fn deterministic_args() {
     let args_1 = test_args_from_seed([0; 32]);
     let args_2 = test_args_from_seed([0; 32]);
     assert_eq!(args_1.verifying_key, args_2.verifying_key);
-    assert_eq!(args_1.iroh_config, args_2.iroh_config);
+    // `IrohConfig` no longer derives `PartialEq`/`Eq` since it gained a
+    // `quic_transport_config: Option<QuicTransportConfig>` field and `QuicTransportConfig` itself
+    // has no equality impl (it wraps an `Arc<dyn ControllerFactory>`), so compare the
+    // deterministic, RNG-derived fields this test actually cares about individually.
+    assert_eq!(args_1.iroh_config.bind_ip_v4, args_2.iroh_config.bind_ip_v4);
+    assert_eq!(
+        args_1.iroh_config.bind_port_v4,
+        args_2.iroh_config.bind_port_v4
+    );
+    assert_eq!(args_1.iroh_config.bind_ip_v6, args_2.iroh_config.bind_ip_v6);
+    assert_eq!(
+        args_1.iroh_config.bind_port_v6,
+        args_2.iroh_config.bind_port_v6
+    );
 }
 
 pub struct TestNode {

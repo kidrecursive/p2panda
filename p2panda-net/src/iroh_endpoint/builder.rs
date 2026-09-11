@@ -49,6 +49,22 @@ impl Builder {
         self
     }
 
+    /// Sets the default QUIC transport parameters applied to the endpoint at bind time.
+    ///
+    /// Replaces the endpoint's hard-coded 5s keep-alive interval / 10s max idle timeout default.
+    /// This only affects the endpoint-wide default: `LogSync`'s own sync sessions always dial
+    /// with plain `connect()`, never `connect_with_config()`, so this is the only transport-config
+    /// knob that actually governs drone/control sync traffic.
+    pub fn quic_transport_config(
+        mut self,
+        quic_transport_config: iroh::endpoint::QuicTransportConfig,
+    ) -> Self {
+        let mut config = self.config.take().unwrap_or_default();
+        config.quic_transport_config = Some(quic_transport_config);
+        self.config = Some(config);
+        self
+    }
+
     /// Adds iroh relay server to assist in establishing direct connections.
     ///
     /// Multiple relays can be added, iroh will automatically choose a "home relay" based on

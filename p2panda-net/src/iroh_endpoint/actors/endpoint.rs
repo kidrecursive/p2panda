@@ -179,12 +179,20 @@ impl ThreadLocalActor for IrohEndpoint {
                     SocketAddrV6::new(config.bind_ip_v6, config.bind_port_v6, 0, 0);
 
                 // Default QUIC transport parameters, can be overwritten when connecting to a node.
-                let quic_transport_config = QuicTransportConfig::builder()
-                    .keep_alive_interval(KEEP_ALIVE_INTERVAL)
-                    .max_idle_timeout(Some(
-                        MAX_IDLE_TIMEOUT.try_into().expect("correct max idle value"),
-                    ))
-                    .build();
+                //
+                // A caller-supplied `quic_transport_config` (via `IrohConfig`/`Builder::
+                // quic_transport_config`) takes precedence; falls back to the previous hard-coded
+                // 5s keep-alive / 10s max idle timeout default when unset.
+                let quic_transport_config = config.quic_transport_config.clone().unwrap_or_else(
+                    || {
+                        QuicTransportConfig::builder()
+                            .keep_alive_interval(KEEP_ALIVE_INTERVAL)
+                            .max_idle_timeout(Some(
+                                MAX_IDLE_TIMEOUT.try_into().expect("correct max idle value"),
+                            ))
+                            .build()
+                    },
+                );
 
                 // Register list of possible "home relays" for this node.
                 let relay_mode = iroh::RelayMode::Custom(state.relay_map.clone());

@@ -14,7 +14,9 @@ mod tests;
 pub(crate) mod user_data;
 
 // Re-export useful iroh types.
-pub use iroh::endpoint::{AfterHandshakeOutcome, BeforeConnectOutcome, EndpointHooks};
+pub use iroh::endpoint::{
+    AfterHandshakeOutcome, BeforeConnectOutcome, EndpointHooks, QuicTransportConfig,
+};
 pub use iroh::{EndpointAddr, RelayUrl};
 
 pub use api::{Endpoint, EndpointError};
