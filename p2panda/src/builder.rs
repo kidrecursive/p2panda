@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use p2panda_net::addrs::TrustedTransportInfo;
+use p2panda_net::addrs::{TransportAddress, TrustedTransportInfo};
 use p2panda_net::discovery::DiscoveryConfig;
 use p2panda_net::gossip::GossipConfig;
 use p2panda_net::iroh_endpoint::{EndpointAddr, RelayUrl};
@@ -151,6 +151,49 @@ impl NodeBuilder {
         self
     }
 
+    /// Inserts a relay-less, IP-only bootstrap node into the local address book.
+    ///
+    /// Unlike `bootstrap()`, this does not require a relay URL: the given direct address is
+    /// stored as a "trusted" transport for `node_id`, letting the discovery algorithm and sync
+    /// layer dial the peer directly on local-area or otherwise fully-routable networks (for
+    /// example air-gapped deployments without access to a relay server).
+    ///
+    /// Calling this repeatedly for the same `node_id` accumulates addresses onto the same
+    /// bootstrap entry rather than replacing it, so several direct addresses (e.g. one per
+    /// network interface) can be registered for one peer.
+    pub fn bootstrap_addr(mut self, node_id: NodeId, addr: SocketAddr) -> Self {
+        let existing_entry = self
+            .config
+            .network
+            .bootstraps
+            .iter()
+            .find(|(existing_node_id, _)| *existing_node_id == node_id)
+            .cloned();
+
+        let mut endpoint_addr = existing_entry
+            .as_ref()
+            .and_then(|(_, transport_info)| {
+                transport_info
+                    .addresses
+                    .iter()
+                    .find_map(|address| match address {
+                        TransportAddress::Iroh(endpoint_addr) => Some(endpoint_addr.clone()),
+                    })
+            })
+            .unwrap_or_else(|| EndpointAddr::new(from_verifying_key(node_id)));
+        endpoint_addr = endpoint_addr.with_ip_addr(addr);
+
+        if let Some(old_entry) = existing_entry {
+            self.config.network.bootstraps.remove(&old_entry);
+        }
+
+        self.config
+            .network
+            .bootstraps
+            .insert((node_id, TrustedTransportInfo::from(endpoint_addr)));
+        self
+    }
+
     /// Sets the mDNS discovery mode.
     ///
     /// mDNS may be set to active, passive or disabled mode.
@@ -242,4 +285,85 @@ enum StoreBuilderOptions {
     Memory,
     Url(String),
     Pool(SqlitePool),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    use p2panda_net::addrs::TransportAddress;
+
+    use super::NodeBuilder;
+    use crate::Credentials;
+
+    fn socket_addr(port: u16) -> SocketAddr {
+        SocketAddr::from((Ipv4Addr::LOCALHOST, port))
+    }
+
+    /// Repeated `bootstrap_addr()` calls for the same node id must accumulate addresses onto a
+    /// single bootstrap entry, not create several separate (and thus competing / overwriting)
+    /// entries.
+    #[test]
+    fn bootstrap_addr_accumulates_addresses_for_same_node() {
+        let node_id = Credentials::generate().verifying_key();
+        let addr_one = socket_addr(4001);
+        let addr_two = socket_addr(4002);
+
+        let builder = NodeBuilder::new()
+            .bootstrap_addr(node_id, addr_one)
+            .bootstrap_addr(node_id, addr_two);
+
+        // Exactly one bootstrap entry exists for this node id ...
+        let matching_entries: Vec<_> = builder
+            .config
+            .network
+            .bootstraps
+            .iter()
+            .filter(|(id, _)| *id == node_id)
+            .collect();
+        assert_eq!(
+            matching_entries.len(),
+            1,
+            "expected a single, merged bootstrap entry per node id"
+        );
+
+        // ... and it carries both addresses, not just the most recent one.
+        let (_, transport_info) = matching_entries[0];
+        assert_eq!(
+            transport_info.addresses.len(),
+            1,
+            "one Iroh transport address"
+        );
+        let TransportAddress::Iroh(endpoint_addr) = &transport_info.addresses[0];
+        let ips: Vec<_> = endpoint_addr.ip_addrs().copied().collect();
+        assert!(ips.contains(&addr_one), "first address missing: {ips:?}");
+        assert!(ips.contains(&addr_two), "second address missing: {ips:?}");
+        assert!(
+            endpoint_addr.relay_urls().next().is_none(),
+            "bootstrap_addr must never attach a relay URL"
+        );
+    }
+
+    /// A single `bootstrap_addr()` call stores exactly the given address, with no relay.
+    #[test]
+    fn bootstrap_addr_stores_ip_only_no_relay() {
+        let node_id = Credentials::generate().verifying_key();
+        let addr = socket_addr(4003);
+
+        let builder = NodeBuilder::new().bootstrap_addr(node_id, addr);
+
+        let (_, transport_info) = builder
+            .config
+            .network
+            .bootstraps
+            .iter()
+            .find(|(id, _)| *id == node_id)
+            .expect("bootstrap entry present");
+        let TransportAddress::Iroh(endpoint_addr) = &transport_info.addresses[0];
+        assert_eq!(
+            endpoint_addr.ip_addrs().copied().collect::<Vec<_>>(),
+            vec![addr]
+        );
+        assert!(endpoint_addr.relay_urls().next().is_none());
+    }
 }
