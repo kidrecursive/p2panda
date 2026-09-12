@@ -4,8 +4,9 @@ use std::hash::Hash as StdHash;
 use std::sync::Arc;
 
 use indexmap::IndexMap;
-use p2panda_core::{AnyHeader, Extensions, Hash, LogId, Operation};
+use p2panda_core::{AnyHeader, Extensions, Hash, LogId, Operation, VerifyingKey};
 use tokio::sync::Mutex;
+use tracing::warn;
 
 #[derive(Debug)]
 pub enum OooResult<'a, E> {
@@ -64,13 +65,29 @@ pub enum OooResult<'a, E> {
 ///
 /// 1. Incoming operations from tombstoned logs / topics were filtered out before.
 /// 2. Duplicate, already ingested operations have been filtered out before.
+///
+/// ## Security note (M4-05 review fix)
+///
+/// Buffer entries are keyed by `(author, backlink, log_id)`, not just `(backlink, log_id)`: a
+/// `LogId` is frequently shared by every author on a topic (e.g. the constant member/key-bundle
+/// log id), so keying on `(backlink, log_id)` alone would let one authorized author forge an
+/// operation whose `header.backlink` equals the hash of a *different* author's real operation --
+/// colliding with that author's own chain lookup (or overwriting their already-buffered entry at
+/// the same key) and letting a forged entry ride along in that author's `Ordered` release batch.
+/// Every operation's own `(author, log_id)` log is independently sequenced (its `seq_num`/
+/// `backlink` chain only ever refers to that same author's prior operations), so a chain walk
+/// only ever needs to hold the author fixed across `pop_from`'s hops.
+/// The concrete `ChainRing` this buffer wraps: `(author, backlink, log_id)`-keyed entries, one
+/// per buffered `Operation<E>`.
+type OooChainRing<L, E> = ChainRing<VerifyingKey, Hash, L, Operation<E>>;
+
 #[derive(Clone, Debug)]
 pub struct OooBuffer<L, E>
 where
     L: LogId,
     E: Extensions,
 {
-    buffer: Arc<Mutex<ChainRing<Hash, L, Operation<E>>>>,
+    buffer: Arc<Mutex<OooChainRing<L, E>>>,
 }
 
 impl<L, E> Default for OooBuffer<L, E>
@@ -181,7 +198,9 @@ where
                     // without this, [4]/[5] would stay buffered until *some other, later*
                     // out-of-order arrival happened to re-trigger a buffer check, which is not
                     // guaranteed to ever happen.
-                    let freed = self.pop_chain_after(operation.hash, log_id).await;
+                    let freed = self
+                        .pop_chain_after(operation.header.verifying_key, operation.hash, log_id)
+                        .await;
                     if freed.is_empty() {
                         OooResult::InOrder(operation)
                     } else {
@@ -234,9 +253,12 @@ where
     /// backlink is `after` -- i.e. releases operations that were waiting on exactly this operation
     /// (M4-05). Used when an operation arrives directly in-order (never itself buffered) but may
     /// still be the missing predecessor for something that *is* sitting in the buffer.
-    async fn pop_chain_after(&self, after: Hash, log_id: &L) -> Vec<Operation<E>> {
+    ///
+    /// `author` scopes the chain walk to `operation`'s own author (see the module-level security
+    /// note): only that author's own buffered entries can ever be released by this operation.
+    async fn pop_chain_after(&self, author: VerifyingKey, after: Hash, log_id: &L) -> Vec<Operation<E>> {
         let mut buffer = self.buffer.lock().await;
-        buffer.pop_from(Some(after), log_id.clone())
+        buffer.pop_from(author, Some(after), log_id.clone())
     }
 
     async fn push_and_pop_from<'a>(
@@ -246,9 +268,11 @@ where
         log_id: &L,
     ) -> OooResult<'a, E> {
         let mut buffer = self.buffer.lock().await;
+        let author = operation.header.verifying_key;
 
         // Push item to ring-buffer, this will eventually evict old items when full.
         buffer.push(
+            author,
             operation.hash,
             operation.header.backlink,
             log_id.clone(),
@@ -268,7 +292,7 @@ where
         //
         // => Return [2, 3]
         // ```
-        let result = buffer.pop_from(expected_backlink, log_id.clone());
+        let result = buffer.pop_from(author, expected_backlink, log_id.clone());
         if result.is_empty() {
             OooResult::OutOfOrder
         } else {
@@ -278,21 +302,24 @@ where
 }
 
 #[derive(Debug)]
-struct ChainRing<ID, L, T>
+struct ChainRing<A, ID, L, T>
 where
+    A: Clone + Eq + StdHash,
     ID: Copy + Eq + StdHash,
     L: Clone + Eq + StdHash,
 {
-    buffer: IndexMap<ChainRingKey<ID, L>, ChainRingValue<ID, T>>,
+    buffer: IndexMap<ChainRingKey<A, ID, L>, ChainRingValue<ID, T>>,
     capacity: usize,
 }
 
 #[derive(Debug, Eq, PartialEq, StdHash)]
-struct ChainRingKey<ID, L>
+struct ChainRingKey<A, ID, L>
 where
+    A: Clone + Eq + StdHash,
     ID: Copy + Eq + StdHash,
     L: Clone + Eq + StdHash,
 {
+    author: A,
     backlink: Option<ID>,
     log_id: L,
 }
@@ -303,10 +330,11 @@ struct ChainRingValue<ID, T> {
     item: T,
 }
 
-impl<ID, L, T> ChainRing<ID, L, T>
+impl<A, ID, L, T> ChainRing<A, ID, L, T>
 where
+    A: Clone + Eq + StdHash + std::fmt::Debug,
     ID: Copy + Eq + StdHash,
-    L: Clone + Eq + StdHash,
+    L: Clone + Eq + StdHash + std::fmt::Debug,
 {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
@@ -315,18 +343,35 @@ where
         }
     }
 
-    pub fn push(&mut self, id: ID, backlink: Option<ID>, log_id: L, item: T) {
+    pub fn push(&mut self, author: A, id: ID, backlink: Option<ID>, log_id: L, item: T) {
         if self.buffer.len() >= self.capacity {
-            self.buffer.pop();
+            // Evict the oldest entry (index 0 -- `IndexMap` preserves insertion order and
+            // `shift_remove`/`shift_remove_index` keep every remaining entry's relative order, so
+            // index 0 is always whichever surviving entry was inserted longest ago). Previously
+            // this called `IndexMap::pop`, which removes the *last* entry, the opposite of the
+            // "oldest evicted first" behavior documented on `OooBuffer` above (M4-05 review fix).
+            if let Some((evicted_key, _evicted_value)) = self.buffer.shift_remove_index(0) {
+                warn!(
+                    author = ?evicted_key.author,
+                    log_id = ?evicted_key.log_id,
+                    buffer_len = self.buffer.len(),
+                    "ooo buffer full, evicting oldest entry"
+                );
+            }
         }
 
         self.buffer.insert(
-            ChainRingKey { backlink, log_id },
+            ChainRingKey {
+                author,
+                backlink,
+                log_id,
+            },
             ChainRingValue { id, item },
         );
     }
 
-    /// Pop all items which have a complete chain from given position.
+    /// Pop all items which have a complete chain from given position, for `author`'s own log
+    /// only (see the module-level security note on `OooBuffer`).
     ///
     /// The position is the id of the item _before_ the to-be-popped range:
     ///
@@ -335,10 +380,11 @@ where
     ///  ^
     /// pop_from(3) -> [4, 5, 6]
     /// ```
-    pub fn pop_from(&mut self, backlink: Option<ID>, log_id: L) -> Vec<T> {
+    pub fn pop_from(&mut self, author: A, backlink: Option<ID>, log_id: L) -> Vec<T> {
         let mut result = Vec::new();
 
         let mut next = ChainRingKey {
+            author: author.clone(),
             backlink,
             log_id: log_id.clone(),
         };
@@ -346,6 +392,7 @@ where
         while let Some(ChainRingValue { id, item }) = self.buffer.shift_remove(&next) {
             result.push(item);
             next = ChainRingKey {
+                author: author.clone(),
                 backlink: Some(id),
                 log_id: log_id.clone(),
             };
@@ -376,39 +423,83 @@ mod tests {
         let mut ring = ChainRing::with_capacity(64);
 
         // Form a chain: 4 <- [5] <- [6] <- [7]
-        ring.push(5, Some(4), "test-log", 5);
-        ring.push(6, Some(5), "test-log", 6);
-        ring.push(7, Some(6), "test-log", 7);
+        ring.push("alice", 5, Some(4), "test-log", 5);
+        ring.push("alice", 6, Some(5), "test-log", 6);
+        ring.push("alice", 7, Some(6), "test-log", 7);
         assert_eq!(ring.len(), 3);
 
         // Try to pop chain range from 3 on, but item [4] is missing.
-        assert!(ring.pop_from(Some(3), "test-log").is_empty());
+        assert!(ring.pop_from("alice", Some(3), "test-log").is_empty());
 
         // Add item [4] to chain: 3 <- [4] <- [5] <- [6] <- [7]
-        ring.push(4, Some(3), "test-log", 4);
+        ring.push("alice", 4, Some(3), "test-log", 4);
         assert_eq!(ring.len(), 4);
 
         // Pop chain range from 3 on.
-        assert_eq!(ring.pop_from(Some(3), "test-log"), vec![4, 5, 6, 7]);
+        assert_eq!(ring.pop_from("alice", Some(3), "test-log"), vec![4, 5, 6, 7]);
         assert_eq!(ring.len(), 0);
     }
 
     #[test]
     fn log_from_beginning() {
         let mut ring = ChainRing::with_capacity(64);
-        ring.push(0, None, "test-log", 0);
-        ring.push(1, Some(0), "test-log", 1);
-        ring.push(2, Some(1), "test-log", 2);
+        ring.push("alice", 0, None, "test-log", 0);
+        ring.push("alice", 1, Some(0), "test-log", 1);
+        ring.push("alice", 2, Some(1), "test-log", 2);
         assert_eq!(ring.len(), 3);
-        assert_eq!(ring.pop_from(None, "test-log"), vec![0, 1, 2]);
+        assert_eq!(ring.pop_from("alice", None, "test-log"), vec![0, 1, 2]);
     }
 
+    /// M4-05 review fix (F2): the ring evicts the *oldest* entry first, matching the struct's own
+    /// doc comment -- previously it evicted the *last-inserted* one (`IndexMap::pop`).
     #[test]
-    fn ring_buffer() {
+    fn ring_buffer_evicts_oldest_first() {
         let mut ring = ChainRing::with_capacity(2);
-        ring.push(1, Some(0), "test-log", 1);
-        ring.push(2, Some(1), "test-log", 2);
-        ring.push(3, Some(2), "test-log", 3);
+        ring.push("alice", 1, Some(0), "test-log", "first");
+        ring.push("alice", 2, Some(1), "test-log", "second");
         assert_eq!(ring.len(), 2);
+
+        // Pushing a third item evicts the first ([1], "first"), not the second.
+        ring.push("alice", 3, Some(2), "test-log", "third");
+        assert_eq!(ring.len(), 2);
+        assert!(ring.pop_from("alice", Some(0), "test-log").is_empty());
+        assert_eq!(
+            ring.pop_from("alice", Some(1), "test-log"),
+            vec!["second", "third"]
+        );
+    }
+
+    /// M4-05 review fix (F1): a `LogId` is often shared by every author on a topic (e.g. the
+    /// constant member/key-bundle log id), so the buffer must key on `(author, backlink, log_id)`
+    /// -- not just `(backlink, log_id)` -- or one author's forged `backlink` (set to equal a
+    /// *different* author's real operation hash) could collide with that other author's chain
+    /// lookup and get released alongside their legitimate operations.
+    #[test]
+    fn cross_author_entries_never_chain_together() {
+        let mut ring = ChainRing::with_capacity(64);
+
+        // Alice's own chain: [10] <- [11].
+        ring.push("alice", 10, None, "shared-log", "alice-0");
+        ring.push("alice", 11, Some(10), "shared-log", "alice-1");
+
+        // Bob (malicious or merely another legitimate author on the same log id) buffers an
+        // operation whose `backlink` happens to equal alice's op [10]'s hash -- same key
+        // components (`backlink`, `log_id`) alice's own chain lookup would use, differing only by
+        // author.
+        ring.push("bob", 99, Some(10), "shared-log", "bob-forged");
+        assert_eq!(ring.len(), 3);
+
+        // Alice's own pop_from must only ever release alice's entries.
+        let released = ring.pop_from("alice", None, "shared-log");
+        assert_eq!(released, vec!["alice-0", "alice-1"]);
+
+        // Bob's entry is untouched -- neither released early nor overwritten -- and pops
+        // correctly under bob's own author.
+        assert_eq!(ring.len(), 1);
+        assert_eq!(
+            ring.pop_from("bob", Some(10), "shared-log"),
+            vec!["bob-forged"]
+        );
+        assert!(ring.is_empty());
     }
 }

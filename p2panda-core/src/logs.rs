@@ -2,6 +2,7 @@
 
 //! Identify append-only logs and compute their differences.
 use std::collections::BTreeMap;
+use std::fmt::Debug;
 use std::hash::Hash as StdHash;
 
 use serde::{Deserialize, Serialize};
@@ -32,9 +33,16 @@ use crate::traits::Author;
 /// Finally, please note that implementers of `LogId` must take steps to ensure their log design
 /// is fit for purpose and that all operations have been thoroughly validated before being
 /// persisted. No such validation checks are provided by `p2panda-store`.
-pub trait LogId: Clone + Eq + Ord + StdHash + Serialize + for<'de> Deserialize<'de> {}
+///
+/// `Debug` is required (M4-05 review fix, F2) for the same reason `Extensions` already requires
+/// it: diagnostic logging (e.g. `p2panda-stream`'s out-of-order buffer, which logs the log id of
+/// an evicted entry) needs it, and every realistic `LogId` implementation already derives it.
+pub trait LogId: Clone + Eq + Ord + StdHash + Serialize + for<'de> Deserialize<'de> + Debug {}
 
-impl<T> LogId for T where T: Clone + Eq + Ord + StdHash + Serialize + for<'de> Deserialize<'de> {}
+impl<T> LogId for T where
+    T: Clone + Eq + Ord + StdHash + Serialize + for<'de> Deserialize<'de> + Debug
+{
+}
 
 /// Sequence number of an entry in an append-only log.
 pub type SeqNum = u32;
