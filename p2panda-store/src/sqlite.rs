@@ -10,6 +10,7 @@ use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::{Sqlite, migrate};
 use thiserror::Error;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use tracing::warn;
 
 /// Creates the SQLite database if it doesn't already exist.
 pub async fn create_database(url: &str) -> Result<(), SqliteError> {
@@ -338,10 +339,29 @@ impl crate::traits::Transaction for SqliteStore {
         // different logic and only makes sure that mutable access to it is exclusive _within_ a
         // process "holding" the transaction permit.
         let mut tx_ref = self.tx.lock().await;
-        assert!(
-            tx_ref.is_none(),
-            "can't have an already existing transaction after an just-acquired permit"
-        );
+
+        // Under normal operation this is always `None` here: `TransactionPermit::drop` rolls back
+        // and clears any transaction left behind by an early return / error, and only releases the
+        // semaphore permit (what gates a NEW `begin` reaching this point) once that rollback has
+        // completed. A leftover `Some` here means a task holding the permit was cancelled (e.g.
+        // `tokio::task::JoinHandle::abort` during shutdown) before its `TransactionPermit`'s Drop
+        // impl's own cleanup task ever got polled to completion under scheduler/CPU pressure --
+        // M4-12 (`square-tower/M4-12-store-teardown-assert.md`, D3-q). Rather than assert/panic on
+        // a detached task in that case (poisoning the store for every future caller with no way to
+        // recover), roll the stale transaction back here, on the new caller's own task, before
+        // starting the new one: no half-applied operation from the aborted holder ever survives,
+        // and `begin` always returns `Ok` once the permit is held.
+        if let Some(stale_tx) = tx_ref.take() {
+            warn!(
+                "SqliteStore::begin: rolling back a transaction left behind by a cancelled \
+                 holder (M4-12); this indicates a task was aborted while holding a store \
+                 transaction"
+            );
+            // Best-effort: if the rollback itself fails there's nothing more to do than drop the
+            // stale transaction and proceed -- the connection is already gone either way.
+            let _ = stale_tx.rollback().await;
+        }
+
         let tx = self.pool.begin().await?;
         tx_ref.replace(tx);
 
@@ -562,6 +582,75 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    /// M4-12 (`square-tower/M4-12-store-teardown-assert.md`, D3-q): reproduces a task cancelled
+    /// while holding a `begin()`ed transaction -- `Handle::shutdown`'s
+    /// `tokio::task::JoinHandle::abort` in the downstream square-tower node -- without depending
+    /// on real scheduler/CPU-pressure timing (upstream only saw this 1/10 stressed local runs).
+    ///
+    /// `TransactionPermit::drop`'s cleanup path (`tokio::spawn`s a task that takes `tx_ref` and
+    /// rolls it back, then drops the semaphore permit) needs an entered runtime to schedule that
+    /// task onto. If the runtime is torn down before the spawned task is ever polled -- exactly
+    /// what a process shutdown shortly after an abort can do -- the task's captured
+    /// `Arc<OwnedSemaphorePermit>` still gets dropped along with the rest of the never-polled
+    /// future (releasing the semaphore), but the code path that clears `tx_ref`
+    /// (`tx.lock().await.take()`) never runs, since the future's body was never executed at all.
+    /// This test reproduces that exact end state directly -- semaphore released, `tx_ref` still
+    /// `Some` -- via the same private fields `begin`/`TransactionPermit::drop` use, rather than
+    /// via a real task abort (whose timing this test would otherwise inherit).
+    #[tokio::test]
+    async fn cancelled_holder_never_poisons_begin() {
+        let store = SqliteStore::temporary().await;
+
+        store
+            .execute(async |pool| {
+                pool.execute("CREATE TABLE test(x INTEGER)").await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        // Mirrors `begin()`'s own steps (acquire the semaphore permit, open a transaction, place
+        // it in `tx_ref`), then the write `tx()` would run through it.
+        let sem_permit = store.semaphore.clone().acquire_owned().await.unwrap();
+        let mut raw_tx = store.pool.begin().await.unwrap();
+        query("INSERT INTO test (x) VALUES (99)")
+            .execute(&mut *raw_tx)
+            .await
+            .unwrap();
+        store.tx.lock().await.replace(raw_tx);
+
+        // Mirrors what `TransactionPermit::drop`'s cleanup task's captured permit clone does when
+        // dropped without ever being polled: release the semaphore, `tx_ref` untouched.
+        drop(sem_permit);
+
+        // Old code: this `begin()` panics ("can't have an already existing transaction after an
+        // just-acquired permit") -- the semaphore permit was released above, but `tx_ref` was
+        // never cleared. Fixed code: rolls the stale transaction back (with a `warn!`) and
+        // returns `Ok`.
+        let permit_2 = store
+            .begin()
+            .await
+            .expect("begin should not panic after a cancelled holder (M4-12)");
+        // Frees the sole (`max_connections(1)`, in-memory) connection back to the pool so the
+        // count check below (via `execute`, a separate acquisition) doesn't itself time out.
+        store.rollback(permit_2).await.unwrap();
+
+        // The cancelled holder's write must not survive -- rolled back, not half-applied.
+        let count: i64 = store
+            .execute(async |pool| {
+                query_scalar("SELECT COUNT(*) FROM test")
+                    .fetch_one(pool)
+                    .await
+                    .map_err(SqliteError::Sqlite)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "a cancelled holder's write must not survive (M4-12)"
+        );
     }
 
     #[tokio::test]

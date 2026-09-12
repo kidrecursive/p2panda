@@ -204,6 +204,7 @@ where
                     .unwrap_or_default();
                 if !current_sessions.is_empty() {
                     debug!(
+                        node_id = %state.endpoint.node_id().fmt_short(),
                         remote_node_id = %node_id.fmt_short(),
                         topic = %topic.fmt_short(),
                         %live_mode,
@@ -213,6 +214,7 @@ where
                 }
 
                 debug!(
+                    node_id = %state.endpoint.node_id().fmt_short(),
                     remote_node_id = %node_id.fmt_short(),
                     topic = %topic.fmt_short(),
                     %live_mode,
@@ -309,6 +311,7 @@ where
                 live_mode,
             } => {
                 debug!(
+                    node_id = %state.endpoint.node_id().fmt_short(),
                     remote = %node_id.fmt_short(),
                     topic = %topic.fmt_short(),
                     %live_mode,

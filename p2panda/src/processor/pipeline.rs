@@ -257,6 +257,7 @@ where
                                     {
                                         tracing::debug!(
                                             target: "p2panda::orderer",
+                                            node_id = %me.fmt_short(),
                                             op = %event.operation.hash.fmt_short(),
                                             deps = ?dependencies
                                                 .iter()
