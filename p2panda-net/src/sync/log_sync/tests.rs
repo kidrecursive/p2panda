@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use iroh::Endpoint;
 use iroh::endpoint::{Connection, presets};
@@ -349,6 +350,109 @@ async fn e2e_three_party_sync() {
             event: Event::LiveModeStarted,
             ..
         })
+    );
+}
+
+/// square-tower fork addition (D3-s, `docs/upstream/p2panda-resync-replaces-session.md`): a
+/// `TopicLogSync` session's offered log set is frozen once it resolves (D24-13) -- any
+/// `(topic, author, log)` association made after that point is unreachable to that peer for the
+/// rest of that session's lifetime, and the ordinary `Initiate` dedupe skips spawning a new
+/// session while any session with that peer is still open. This proves the fix: after Alice's
+/// live session with Bob has already resolved (both sides through `LiveModeStarted`), Alice
+/// associates a brand new log with the topic and calls `SyncHandle::resync` -- Bob must receive
+/// that new log's operation via the *fresh* session's ordinary log-diff catch-up (nothing is
+/// published to the live channel), not merely "eventually". Fails before the fix (the new log is
+/// never offered to the still-open, frozen session and nothing ever re-diffs it) -- mutation
+/// evidence in the PR pastes both runs.
+#[tokio::test]
+async fn resync_replaces_live_session_recovering_late_association() {
+    setup_logging();
+
+    let topic: Topic = [90; 32].into();
+    let existing_log_id = 0;
+    let new_log_id = 1;
+
+    let mut bob = TestNode::spawn([80; 32], None).await;
+    let mut alice = TestNode::spawn([81; 32], Some(bob.node_info())).await;
+
+    alice
+        .client
+        .create_operation(b"alice's first log", existing_log_id)
+        .await;
+    alice
+        .client
+        .associate(
+            &topic,
+            &HashMap::from([(alice.client_id(), vec![existing_log_id])]),
+        )
+        .await;
+
+    bob.client
+        .create_operation(b"bob's first log", existing_log_id)
+        .await;
+    bob.client
+        .associate(
+            &topic,
+            &HashMap::from([(bob.client_id(), vec![existing_log_id])]),
+        )
+        .await;
+
+    let alice_handle = alice.log_sync.stream(topic, true).await.unwrap();
+    let mut alice_subscription = alice_handle.subscribe().await.unwrap();
+
+    let bob_handle = bob.log_sync.stream(topic, true).await.unwrap();
+    let mut bob_subscription = bob_handle.subscribe().await.unwrap();
+
+    alice_handle.initiate_session(bob.node_id());
+
+    // Drain both sides' first session (session_id 0) through to live mode -- the session is now
+    // "resolved" in the D24-13 sense: its offered log set is frozen.
+    for sub in [&mut alice_subscription, &mut bob_subscription] {
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(10), sub.next())
+                .await
+                .expect("first session should reach live mode")
+                .unwrap()
+                .unwrap();
+            if matches!(event.event, Event::LiveModeStarted) {
+                break;
+            }
+        }
+    }
+
+    // A NEW log is created and associated with the topic *after* the live session above already
+    // resolved its offered log set.
+    let (new_header, _, _) = alice
+        .client
+        .create_operation(b"alice's new log, associated after resolve", new_log_id)
+        .await;
+    alice
+        .client
+        .associate(
+            &topic,
+            &HashMap::from([(alice.client_id(), vec![new_log_id])]),
+        )
+        .await;
+
+    // The periodic resync (what this test stands in for) replaces the live session.
+    alice_handle.resync(bob.node_id());
+
+    // Bob must see the new log's operation delivered by the fresh session's ordinary log-diff
+    // catch-up.
+    let found = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let event = bob_subscription.next().await.unwrap().unwrap();
+            if let Event::OperationReceived { operation, .. } = event.event {
+                if operation.hash == new_header.hash() {
+                    return;
+                }
+            }
+        }
+    })
+    .await;
+    assert!(
+        found.is_ok(),
+        "bob must receive the late-associated log's operation after alice's resync"
     );
 }
 

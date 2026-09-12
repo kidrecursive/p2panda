@@ -95,6 +95,31 @@ where
             .unwrap();
     }
 
+    /// Explicitly resyncs with the given node, REPLACING a live session for this topic if one
+    /// exists and its initial catch-up phase has already finished.
+    ///
+    /// square-tower fork addition (`square-tower/main`, D3-s in the downstream project's
+    /// `decisions.md`): a `TopicLogSync` session's offered log set is frozen once it resolves
+    /// (D24-13) -- any `(topic, author, log)` association made after that point is unreachable to
+    /// that peer for the rest of that session's lifetime, and `initiate_session`'s `Initiate`
+    /// dedupe skips spawning a new session for as long as any session with that peer stays open.
+    /// This method exists for exactly that case: closing an already-caught-up live session and
+    /// starting a fresh one (full log-set resolve + live mode), so a late association becomes
+    /// reachable within one call. If the peer's session is still in its initial catch-up, this is a
+    /// no-op (logged `debug!`, not retried here -- the caller is expected to be a periodic task
+    /// that will call again on its own schedule). If there's no live session at all, this behaves
+    /// exactly like `initiate_session`. Runs the same `ConnectionAuthoriser` check
+    /// `initiate_session` runs, unconditionally -- no bypass. Intended for use ONLY by the node's
+    /// own periodic resync task (`p2panda::streams::StreamPublisher::resync`/`p2panda::spaces::
+    /// Space::resync`), never the gossip-driven path, which keeps using `initiate_session`'s
+    /// existing dedupe unchanged. Upstream PR draft:
+    /// `docs/upstream/p2panda-resync-replaces-session.md`.
+    pub fn resync(&self, node_id: crate::NodeId) {
+        self.manager_ref
+            .send_message(ToSyncManager::Resync(self.topic, node_id))
+            .unwrap();
+    }
+
     /// Close the associated sync session gracefully.
     ///
     /// This method can be awaited to ensure that all sync-related state has been cleaned up.

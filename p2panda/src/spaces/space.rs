@@ -38,6 +38,10 @@ use crate::streams::{
 };
 
 /// Wraps topic stream and returns the pub/sub pair of a more specialised spaces stream.
+// D3-m added `control_lock`, D3-s's resync plumbing threads the rest through unchanged --
+// together they push this over clippy's default arg-count lint; all eight are genuinely
+// independent construction inputs, not a struct-shaped grouping in disguise.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spaces_stream<M>(
     inner: InnerSpace,
     store: SqliteStore,
@@ -109,11 +113,12 @@ where
         self.inner.id()
     }
 
-    /// Manually (re-)starts a sync session with `node_id` for this space's topic.
+    /// Manually resyncs with `node_id` for this space's topic, REPLACING a live session whose
+    /// catch-up has already finished.
     ///
-    /// square-tower fork addition (`square-tower/main`, D3-k in the downstream project's
+    /// square-tower fork addition (`square-tower/main`, D3-s in the downstream project's
     /// `decisions.md`); see `StreamPublisher::resync`'s doc comment for the mechanism this
-    /// recovers from. Upstream PR draft: `docs/upstream/p2panda-manual-resync.md`.
+    /// recovers from. Upstream PR draft: `docs/upstream/p2panda-resync-replaces-session.md`.
     pub fn resync(&self, node_id: p2panda_net::NodeId) {
         self.tx.resync(node_id);
     }

@@ -145,20 +145,22 @@ where
         self.topic
     }
 
-    /// Manually (re-)starts a sync session with `node_id` for this topic.
+    /// Manually resyncs with `node_id` for this topic, REPLACING a live session whose catch-up has
+    /// already finished so a log association made after that session resolved becomes reachable.
     ///
-    /// square-tower fork addition (`square-tower/main`, D3-k in the downstream project's
-    /// `decisions.md`): a thin wrapper around `p2panda_net::sync::SyncHandle::initiate_session`.
-    /// Intended for a periodic, node-side "resync" task that recovers from a sync session that
-    /// ended gracefully (no error) and was therefore never automatically retried -- e.g. gossip's
+    /// square-tower fork addition (`square-tower/main`, D3-s in the downstream project's
+    /// `decisions.md`, superseding D3-k's plain `initiate_session` wrapper): a thin wrapper around
+    /// `p2panda_net::sync::SyncHandle::resync`. Intended for a periodic, node-side "resync" task:
+    /// besides recovering from a sync session that ended gracefully (no error, e.g. gossip's
     /// HyParView active-view churn dropping an already-admitted, still-reachable, still-allowed
-    /// peer (`GossipEvent::NeighbourDown` -> `ToSyncManager::EndSync`), which
-    /// `p2panda-net/src/sync/actors/topic_manager.rs`'s own retry path (`ActorFailed` only) never
-    /// undoes on its own. Upstream PR draft: `docs/upstream/p2panda-manual-resync.md`. If there is
-    /// no transport information for `node_id` this is a silent no-op (mirrors `SyncHandle::
-    /// initiate_session`'s own documented behavior).
+    /// peer -- `GossipEvent::NeighbourDown` -> `ToSyncManager::EndSync`, which
+    /// `p2panda-net/src/sync/actors/topic_manager.rs`'s own retry path never undoes on its own), it
+    /// now also recovers a *still-live* session whose offered log set was frozen before a later
+    /// `(topic, author, log)` association (D24-13). Upstream PR draft:
+    /// `docs/upstream/p2panda-resync-replaces-session.md`. If there is no transport information for
+    /// `node_id` this is a silent no-op (mirrors `SyncHandle::resync`'s own documented behavior).
     pub fn resync(&self, node_id: p2panda_net::NodeId) {
-        self.sync_handle.initiate_session(node_id);
+        self.sync_handle.resync(node_id);
     }
 
     /// Publish a message into a topic stream.

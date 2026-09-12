@@ -66,6 +66,15 @@ pub enum ToSyncManager<M, E> {
     /// Initiate sync session.
     InitiateSync(Topic, NodeId),
 
+    /// square-tower fork addition (D3-s): explicitly resync with this peer -- forwarded to
+    /// `ToTopicManager::Resync`, which REPLACES a live session for this (peer, topic) once its
+    /// catch-up phase has finished, instead of `InitiateSync`'s dedupe-and-skip. Runs the exact
+    /// same `ConnectionAuthoriser` check as `InitiateSync`, unconditionally -- this path must never
+    /// widen who a peer is allowed to sync with, only when an already-allowed peer's session gets
+    /// refreshed. Sent only by `SyncHandle::resync` (the node's own periodic resync task, never the
+    /// gossip-driven path).
+    Resync(Topic, NodeId),
+
     /// Accept sync session.
     Accept(NodeId, Topic, Connection),
 
@@ -439,6 +448,49 @@ where
                     );
 
                     sync_manager_actor.send_message(ToTopicManager::Initiate {
+                        node_id,
+                        topic,
+                        live_mode: *live_mode,
+                    })?;
+                }
+            }
+            ToSyncManager::Resync(topic, node_id) => {
+                // Authorise that we should be connecting on this topic with the remote node --
+                // identical check to `InitiateSync` above; a resync must never bypass this.
+                if state
+                    .connection_authoriser
+                    .can_connect_on_topic(node_id, topic)
+                    .await
+                {
+                    state
+                        .connection_authoriser
+                        .send_event(ConnectionAuthoriserEvent::TopicAllowed {
+                            topic,
+                            node: node_id,
+                        })
+                        .await;
+                } else {
+                    let event = ConnectionAuthoriserEvent::TopicBlocked {
+                        topic,
+                        node: node_id,
+                    };
+                    warn!("{}", event);
+                    state.connection_authoriser.send_event(event).await;
+
+                    // Do not resync with a blocked topic-node combination.
+                    return Ok(());
+                }
+
+                if let Some((sync_manager_actor, live_mode)) =
+                    state.topic_managers.topic_manager_map.get(&topic)
+                {
+                    debug!(
+                        topic = topic.fmt_short(),
+                        node_id = node_id.fmt_short(),
+                        "resync sync session",
+                    );
+
+                    sync_manager_actor.send_message(ToTopicManager::Resync {
                         node_id,
                         topic,
                         live_mode: *live_mode,

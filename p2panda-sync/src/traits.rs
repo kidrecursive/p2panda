@@ -50,4 +50,15 @@ pub trait Manager<T> {
 
     /// Subscribe to the manager event stream.
     fn subscribe(&mut self) -> impl Stream<Item = FromSync<Self::Event>> + Send + Unpin + 'static;
+
+    /// Returns `true` when the given session event marks the end of a session's initial catch-up
+    /// (log-diff/history resolve) phase -- i.e. the session has resolved its offered log set and
+    /// is about to either enter live mode or end.
+    ///
+    /// square-tower fork addition (D3-s, `docs/upstream/p2panda-resync-replaces-session.md`): used
+    /// by `p2panda-net`'s `TopicManager` to decide whether an explicit resync (a caller-driven
+    /// session replacement, as opposed to the ordinary gossip-driven `Initiate`) may safely close
+    /// and replace a still-live session -- doing so while catch-up is in progress would drop
+    /// operations the peer hasn't fully caught up on yet.
+    fn is_catch_up_finished(event: &Self::Event) -> bool;
 }

@@ -221,6 +221,13 @@ where
 
         Box::pin(stream)
     }
+
+    /// square-tower fork addition (D3-s): the initial catch-up phase is over once `TopicLogSync`
+    /// has resolved its offered log set and emitted `SyncFinished` -- see the `Manager::
+    /// is_catch_up_finished` doc comment for why `p2panda-net` needs this.
+    fn is_catch_up_finished(event: &Self::Event) -> bool {
+        matches!(event, TopicLogSyncEvent::SyncFinished { .. })
+    }
 }
 
 /// Error types which can be returned from `TopicSyncManager`.

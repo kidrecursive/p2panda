@@ -33,6 +33,10 @@ const TEST_PROTOCOL_ID: [u8; 32] = [101; 32];
 struct FailingNode {
     args: ApplicationArguments,
     sync_ref: ActorRef<ToSyncManager<DummySyncMessage, DummySyncEvent>>,
+    // square-tower fork addition (D3-s): kept around (not just handed to `SyncManager::spawn`) so
+    // tests can flip it to `restrictive` after the node has already spawned and prove a resync
+    // still respects it.
+    connection_authoriser: ConnectionAuthoriser,
 }
 
 impl FailingNode {
@@ -79,7 +83,11 @@ impl FailingNode {
             .await
             .unwrap();
 
-        Self { args, sync_ref }
+        Self {
+            args,
+            sync_ref,
+            connection_authoriser,
+        }
     }
 
     pub fn node_id(&self) -> NodeId {
@@ -231,6 +239,10 @@ impl SyncManagerTrait<Topic> for DummySyncManager<FailingSyncArgs, FailingSyncPr
         let stream = BroadcastStream::new(self.event_tx.subscribe())
             .filter_map(|event| async { event.ok() });
         Box::pin(stream)
+    }
+
+    fn is_catch_up_finished(event: &Self::Event) -> bool {
+        matches!(event, DummySyncEvent::SyncFinished)
     }
 }
 
@@ -393,6 +405,140 @@ async fn graceful_session_end_is_not_retried_but_manual_resync_recovers() {
         ),
         "manual resync should start a fresh session: {:#?}",
         event
+    );
+
+    alice.shutdown();
+    bob.shutdown();
+}
+
+/// square-tower fork addition (D3-s, `docs/upstream/p2panda-resync-replaces-session.md`): a
+/// resync must not replace a session whose catch-up is still in progress -- `DummySyncManager`
+/// (this file's own test harness) never emits `SyncFinished` at all, so any session built on it
+/// is, by construction, permanently "still catching up" from `Manager::is_catch_up_finished`'s
+/// point of view. This proves `SyncHandle::resync` skips such a session (no second
+/// `SessionCreated`) rather than churning it, no matter how many times it's called.
+#[tokio::test]
+async fn resync_skips_while_catch_up_in_progress() {
+    setup_logging();
+
+    let topic = [2; 32].into();
+
+    // `Wait` keeps the session open, blocked reading, indefinitely.
+    let (bob_sync_config, _bob_rx) = FailingSyncArgs::new(SyncBehaviour::Wait);
+    let mut bob = FailingNode::spawn(random(), vec![], bob_sync_config).await;
+
+    let (alice_sync_config, _alice_rx) = FailingSyncArgs::new(SyncBehaviour::Wait);
+    let alice = FailingNode::spawn(random(), vec![bob.args.node_info()], alice_sync_config).await;
+
+    let alice_handle = {
+        let manager_ref = call!(alice.sync_ref, ToSyncManager::Create, topic, true).unwrap();
+        SyncHandle::new(topic, alice.sync_ref.clone(), manager_ref)
+    };
+    let mut alice_subscription = alice_handle.subscribe().await.unwrap();
+
+    let _bob_handle = {
+        let manager_ref = call!(bob.sync_ref, ToSyncManager::Create, topic, true).unwrap();
+        SyncHandle::new(topic, bob.sync_ref.clone(), manager_ref)
+    };
+
+    let expected_remote = bob.node_id();
+
+    alice_handle.initiate_session(expected_remote);
+    let event = alice_subscription.next().await.unwrap();
+    assert!(
+        matches!(
+            event,
+            Ok(FromSync {
+                session_id: 0,
+                remote,
+                event: DummySyncEvent::SessionCreated
+            }) if remote == expected_remote
+        ),
+        "{:#?}",
+        event
+    );
+
+    // Try to resync repeatedly while the session is still open (`Wait` never finishes catch-up).
+    // None of these may create a second session.
+    for _ in 0..5 {
+        alice_handle.resync(expected_remote);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let no_replacement =
+        tokio::time::timeout(Duration::from_millis(500), alice_subscription.next()).await;
+    assert!(
+        no_replacement.is_err(),
+        "resync must not replace a session whose catch-up never finished, but got: {no_replacement:?}"
+    );
+
+    alice.shutdown();
+    bob.shutdown();
+}
+
+/// square-tower fork addition (D3-s): a resync must run the exact same `ConnectionAuthoriser`
+/// check `initiate_session` runs -- no bypass. Mirrors
+/// `graceful_session_end_is_not_retried_but_manual_resync_recovers`'s scaffold (a `Graceful`
+/// session ends on its own after ~200ms, so `node_session_map` is empty and a subsequent resync
+/// takes the "no live session -> plain Initiate" branch) but flips the authoriser to
+/// `restrictive` (no explicit allow for the remote) first: unlike that test, no fresh
+/// `SessionCreated` may appear.
+#[tokio::test]
+async fn resync_respects_connection_authoriser_block() {
+    setup_logging();
+
+    let topic = [3; 32].into();
+
+    let (bob_sync_config, _bob_rx) = FailingSyncArgs::new(SyncBehaviour::Graceful);
+    let mut bob = FailingNode::spawn(random(), vec![], bob_sync_config).await;
+
+    let (alice_sync_config, _alice_rx) = FailingSyncArgs::new(SyncBehaviour::Graceful);
+    let alice = FailingNode::spawn(random(), vec![bob.args.node_info()], alice_sync_config).await;
+
+    let alice_handle = {
+        let manager_ref = call!(alice.sync_ref, ToSyncManager::Create, topic, true).unwrap();
+        SyncHandle::new(topic, alice.sync_ref.clone(), manager_ref)
+    };
+    let mut alice_subscription = alice_handle.subscribe().await.unwrap();
+
+    let _bob_handle = {
+        let manager_ref = call!(bob.sync_ref, ToSyncManager::Create, topic, true).unwrap();
+        SyncHandle::new(topic, bob.sync_ref.clone(), manager_ref)
+    };
+
+    let expected_remote = bob.node_id();
+
+    // First session, allowed by the default-permissive authoriser.
+    alice_handle.initiate_session(expected_remote);
+    let event = alice_subscription.next().await.unwrap();
+    assert!(
+        matches!(
+            event,
+            Ok(FromSync {
+                session_id: 0,
+                remote,
+                event: DummySyncEvent::SessionCreated
+            }) if remote == expected_remote
+        ),
+        "{:#?}",
+        event
+    );
+
+    // Let the graceful session actually terminate (~200ms sleep + Ok(())) so `node_session_map`
+    // is empty by the time we call resync, exercising the "no live session" branch -- the same
+    // branch `graceful_session_end_is_not_retried_but_manual_resync_recovers` proves creates a
+    // fresh session when nothing blocks it.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Block: the identical call sequence must now produce no new session at all.
+    alice.connection_authoriser.restrictive().await;
+
+    alice_handle.resync(expected_remote);
+
+    let blocked = tokio::time::timeout(Duration::from_millis(800), alice_subscription.next()).await;
+    assert!(
+        blocked.is_err(),
+        "a resync must not bypass the ConnectionAuthoriser block, but got: {blocked:?}"
     );
 
     alice.shutdown();

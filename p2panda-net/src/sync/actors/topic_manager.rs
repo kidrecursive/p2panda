@@ -13,6 +13,7 @@ use std::error::Error as StdError;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 
 use futures_util::{Sink, SinkExt};
 use iroh::endpoint::Connection;
@@ -75,6 +76,20 @@ pub enum ToTopicManager<T> {
         node_id: NodeId,
         reply: oneshot::Sender<()>,
     },
+
+    /// square-tower fork addition (D3-s): explicitly resync with this peer, REPLACING a live
+    /// session for this (peer, topic) if one exists and has already finished its initial catch-up
+    /// (`Manager::is_catch_up_finished`) -- close it, wait for it to actually terminate, then
+    /// initiate a fresh session (full log-set resolve + live mode). If a catch-up is still in
+    /// progress for the current session, this is a no-op (logged). If there's no live session,
+    /// this behaves exactly like `Initiate`. Sent ONLY by the node's own periodic resync
+    /// (`SyncHandle::resync`, via `ToSyncManager::Resync`), never by the gossip-driven path, which
+    /// keeps using plain `Initiate` and its existing dedupe unchanged.
+    Resync {
+        node_id: NodeId,
+        topic: Topic,
+        live_mode: bool,
+    },
 }
 
 pub struct TopicManagerState<M>
@@ -92,6 +107,20 @@ where
     sync_poller_actor: ActorRef<ToSyncPoller>,
     endpoint: Endpoint,
     pool: ThreadLocalActorSpawner,
+
+    /// square-tower fork addition (D3-s): per-session, whether `Manager::is_catch_up_finished` has
+    /// been observed. Populated by a background task (spawned in `pre_start`) subscribed to the
+    /// same broadcast channel the poller forwards session events on -- no new event source, just
+    /// an additional listener. Missing/`false` is the safe default: a resync treats "we haven't
+    /// seen catch-up finish yet" the same as "still in catch-up".
+    session_catch_up: Arc<Mutex<HashMap<SyncSessionId, bool>>>,
+
+    /// square-tower fork addition (D3-s): node ids whose live session is currently being closed as
+    /// part of an in-progress resync replacement, mapped to the `live_mode` the fresh session
+    /// should use once the old one has actually terminated (`ActorTerminated`/`ActorFailed`). A
+    /// second `Resync` for a node already in this map is a no-op (at most one replacement in
+    /// flight per (peer, topic) at a time).
+    pending_resync: HashMap<NodeId, bool>,
 }
 
 #[derive(Debug)]
@@ -134,6 +163,32 @@ where
         let mut manager = M::from_args(config);
         let event_stream = manager.subscribe();
 
+        // square-tower fork addition (D3-s): subscribe to the same broadcast channel the poller
+        // below forwards session events on (before `sender` moves into the poller's arguments) so
+        // we can track, per session id, whether `Manager::is_catch_up_finished` has fired -- this
+        // reads events already flowing through the actor, it does not add a new event source.
+        let session_catch_up = Arc::new(Mutex::new(HashMap::<SyncSessionId, bool>::new()));
+        {
+            let mut event_rx = sender.subscribe();
+            let session_catch_up = session_catch_up.clone();
+            tokio::spawn(async move {
+                loop {
+                    match event_rx.recv().await {
+                        Ok(event) => {
+                            if M::is_catch_up_finished(&event.event) {
+                                session_catch_up
+                                    .lock()
+                                    .expect("session_catch_up mutex poisoned")
+                                    .insert(event.session_id, true);
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+        }
+
         // The sync poller actor lives as long as the manager and only terminates due to the
         // manager actor itself terminating.
         let (sync_poller_actor, _) =
@@ -152,6 +207,8 @@ where
             sync_poller_actor,
             endpoint,
             pool,
+            session_catch_up,
+            pending_resync: HashMap::new(),
         })
     }
 
@@ -412,6 +469,78 @@ where
 
                 let _ = reply.send(());
             }
+            ToTopicManager::Resync {
+                node_id,
+                topic,
+                live_mode,
+            } => {
+                if state.pending_resync.contains_key(&node_id) {
+                    debug!(
+                        node_id = %state.endpoint.node_id().fmt_short(),
+                        remote_node_id = %node_id.fmt_short(),
+                        topic = %topic.fmt_short(),
+                        "skip resync: a replacement is already in flight for this node"
+                    );
+                    return Ok(());
+                }
+
+                let current_sessions = state
+                    .node_session_map
+                    .get(&node_id)
+                    .cloned()
+                    .unwrap_or_default();
+
+                if current_sessions.is_empty() {
+                    debug!(
+                        node_id = %state.endpoint.node_id().fmt_short(),
+                        remote_node_id = %node_id.fmt_short(),
+                        topic = %topic.fmt_short(),
+                        %live_mode,
+                        "resync: no live session, initiating"
+                    );
+                    myself.send_message(ToTopicManager::Initiate {
+                        node_id,
+                        topic,
+                        live_mode,
+                    })?;
+                    return Ok(());
+                }
+
+                let catch_up_in_progress = {
+                    let session_catch_up = state
+                        .session_catch_up
+                        .lock()
+                        .expect("session_catch_up mutex poisoned");
+                    current_sessions
+                        .iter()
+                        .any(|id| !session_catch_up.get(id).copied().unwrap_or(false))
+                };
+
+                if catch_up_in_progress {
+                    debug!(
+                        node_id = %state.endpoint.node_id().fmt_short(),
+                        remote_node_id = %node_id.fmt_short(),
+                        topic = %topic.fmt_short(),
+                        "skip resync: catch-up in progress"
+                    );
+                    return Ok(());
+                }
+
+                debug!(
+                    node_id = %state.endpoint.node_id().fmt_short(),
+                    remote_node_id = %node_id.fmt_short(),
+                    topic = %topic.fmt_short(),
+                    %live_mode,
+                    "resync: replacing live session"
+                );
+                state.pending_resync.insert(node_id, live_mode);
+
+                for id in &current_sessions {
+                    if let Some(handle) = state.session_topic_map.sender_mut(*id) {
+                        let _ = handle.send(ToSync::Close).await;
+                    }
+                }
+            }
         }
 
         Ok(())
@@ -434,7 +563,36 @@ where
                             "sync session terminated"
                         );
 
+                        // square-tower fork addition (D3-s): capture which node owned this
+                        // session before `drop_session` clears the mapping, so a resync
+                        // replacement pending on this exact session can be resumed now that the
+                        // old session has actually terminated (not merely been asked to close).
+                        let owner = state.node_session_map.iter().find_map(|(node_id, sessions)| {
+                            sessions.contains(&session_id).then_some(*node_id)
+                        });
+
                         Self::drop_session(state, session_id);
+                        state
+                            .session_catch_up
+                            .lock()
+                            .expect("session_catch_up mutex poisoned")
+                            .remove(&session_id);
+
+                        if let Some(node_id) = owner
+                            && let Some(live_mode) = state.pending_resync.remove(&node_id)
+                        {
+                            debug!(
+                                remote_node_id = %node_id.fmt_short(),
+                                topic = state.topic.fmt_short(),
+                                %live_mode,
+                                "resync: previous session terminated, starting fresh session"
+                            );
+                            let _ = myself.send_message(ToTopicManager::Initiate {
+                                node_id,
+                                topic: state.topic,
+                                live_mode,
+                            });
+                        }
                     }
                     None => {
                         let actor_id = actor_cell.get_id();
@@ -471,11 +629,42 @@ where
                             // If it wasn't present then it means we no longer want to sync with
                             // this node, clear up any session state and return.
                             Self::drop_session(state, session_id);
+                            state
+                                .session_catch_up
+                                .lock()
+                                .expect("session_catch_up mutex poisoned")
+                                .remove(&session_id);
                             return Ok(());
                         };
 
                         // Clear up any state from the failed session.
                         Self::drop_session(state, session_id);
+                        state
+                            .session_catch_up
+                            .lock()
+                            .expect("session_catch_up mutex poisoned")
+                            .remove(&session_id);
+
+                        // square-tower fork addition (D3-s): a resync replacement's `Close` can
+                        // race the old session into failing instead of terminating gracefully
+                        // (e.g. the remote closes the connection first). Either way, the old
+                        // session is gone, so resume the pending replacement the same as the
+                        // graceful path -- and skip the normal failure-retry timer, since we're
+                        // already re-initiating immediately.
+                        if let Some(live_mode) = state.pending_resync.remove(&remote_node_id) {
+                            debug!(
+                                remote_node_id = %remote_node_id.fmt_short(),
+                                topic = state.topic.fmt_short(),
+                                %live_mode,
+                                "resync: previous session failed while closing, starting fresh session"
+                            );
+                            let _ = myself.send_message(ToTopicManager::Initiate {
+                                node_id: remote_node_id,
+                                topic: state.topic,
+                                live_mode,
+                            });
+                            return Ok(());
+                        }
 
                         // If this node was removed from the active sync set we skip retrying.
                         if !state.active_sync_set.contains(&remote_node_id) {
