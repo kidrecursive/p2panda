@@ -141,7 +141,7 @@ where
                         node_id = ?self.node_id.map(|id| id.fmt_short()),
                         op = %hash.fmt_short(),
                         author = %Borrow::<Operation<E>>::borrow(&input).header.verifying_key.fmt_short(),
-                        log_id = ?args.log_id,
+                        log_id = %format!("{:?}", args.log_id).chars().take(24).collect::<String>(),
                         seq_num = %Borrow::<Operation<E>>::borrow(&input).header.seq_num,
                         "buffered with no known predecessor for its (author, log_id)"
                     );

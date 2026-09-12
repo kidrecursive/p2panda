@@ -199,8 +199,14 @@ where
         // TODO: Only required until https://github.com/p2panda/p2panda/issues/1362 is resolved.
         update_authoriser(&self.connection_authoriser, &events).await;
 
-        self.process_change(guard, groups_y, space_y, [auth_message, space_message], events)
-            .await?;
+        self.process_change(
+            guard,
+            groups_y,
+            space_y,
+            [auth_message, space_message],
+            events,
+        )
+        .await?;
 
         Ok(())
     }
@@ -231,8 +237,14 @@ where
         // TODO: Only required until https://github.com/p2panda/p2panda/issues/1362 is resolved.
         update_authoriser(&self.connection_authoriser, &events).await;
 
-        self.process_change(guard, groups_y, space_y, [auth_message, space_message], events)
-            .await?;
+        self.process_change(
+            guard,
+            groups_y,
+            space_y,
+            [auth_message, space_message],
+            events,
+        )
+        .await?;
 
         Ok(())
     }
@@ -274,8 +286,14 @@ where
             )
             .await?;
 
-        self.process_change(guard, groups_y, space_y, [auth_message, space_message], events)
-            .await?;
+        self.process_change(
+            guard,
+            groups_y,
+            space_y,
+            [auth_message, space_message],
+            events,
+        )
+        .await?;
 
         Ok(())
     }
@@ -317,8 +335,14 @@ where
             )
             .await?;
 
-        self.process_change(guard, groups_y, space_y, [auth_message, space_message], events)
-            .await?;
+        self.process_change(
+            guard,
+            groups_y,
+            space_y,
+            [auth_message, space_message],
+            events,
+        )
+        .await?;
 
         Ok(())
     }

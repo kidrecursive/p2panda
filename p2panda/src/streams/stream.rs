@@ -42,6 +42,7 @@ use crate::streams::replay::{ReplayError, StreamFrom, replay_log_ranges};
 use crate::streams::subscription::StreamSubscription;
 use crate::streams::sync_metrics::{self, Aggregator, SessionPhase, SyncError};
 use crate::streams::{Event, Pipeline, SystemEvent};
+use p2panda_stream::ingest::{IngestError, IngestResult};
 
 /// Number of items which can stay in the buffer before the application-layer picks up the
 /// operations. If buffer runs full the processor will pause work and we'll apply backpressure to
@@ -512,7 +513,9 @@ pub(crate) async fn process_operation_in(
         node_id = %node_id.fmt_short(),
         topic = %topic.to_hex(),
         op = %p2panda_core::traits::ShortFormat::fmt_short(&event.operation.hash),
-        ingest = ?event.ingest,
+        // Variant name only: `Debug` on the full result would dump entire operations (incl.
+        // key-bundle material) into logs (trust-boundary review of M4-14).
+        ingest = %ingest_summary(&event.ingest),
         "process operation ingest result"
     );
 
@@ -1056,4 +1059,21 @@ pub enum Source {
 
     /// Source when an operation was published locally or replayed.
     LocalStore,
+}
+
+/// Variant-only summary of an ingest status for log lines. Never `Debug`-formats the full
+/// result: `Ordered` carries whole operations, and group/member-control operations embed
+/// key-bundle material (trust-boundary review of M4-14).
+fn ingest_summary<E>(status: &ProcessorStatus<IngestResult<E>, IngestError>) -> String {
+    match status {
+        ProcessorStatus::Pending => "pending".to_string(),
+        ProcessorStatus::Failed(err) => format!("failed({err})"),
+        ProcessorStatus::Completed(IngestResult::Inserted) => "inserted".to_string(),
+        ProcessorStatus::Completed(IngestResult::AlreadyExists) => "already_exists".to_string(),
+        ProcessorStatus::Completed(IngestResult::Ordered(ops)) => format!("ordered({})", ops.len()),
+        ProcessorStatus::Completed(IngestResult::OutOfOrder { no_predecessor }) => {
+            format!("out_of_order(no_predecessor={no_predecessor})")
+        }
+        ProcessorStatus::Completed(IngestResult::Outdated) => "outdated".to_string(),
+    }
 }

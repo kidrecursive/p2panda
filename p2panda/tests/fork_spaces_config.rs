@@ -38,11 +38,15 @@ async fn spaces_config_pre_key_lifetime_is_applied() {
     let lifetime = *member.key_bundle().lifetime();
 
     assert!(
-        lifetime.verify_with_window(Duration::from_secs(3599)).is_ok(),
+        lifetime
+            .verify_with_window(Duration::from_secs(3599))
+            .is_ok(),
         "a 1h pre_key_lifetime must still be valid ~1h out"
     );
     assert!(
-        lifetime.verify_with_window(Duration::from_secs(3601)).is_err(),
+        lifetime
+            .verify_with_window(Duration::from_secs(3601))
+            .is_err(),
         "a 1h pre_key_lifetime must be expired just past 1h out -- the 90 day default would \
          wrongly still be valid here"
     );
@@ -62,7 +66,11 @@ async fn default_spaces_config_keeps_previous_90_day_lifetime() {
     let lifetime = *member.key_bundle().lifetime();
 
     // A 1h window is trivially satisfied by a 90 day lifetime.
-    assert!(lifetime.verify_with_window(Duration::from_secs(60 * 60)).is_ok());
+    assert!(
+        lifetime
+            .verify_with_window(Duration::from_secs(60 * 60))
+            .is_ok()
+    );
     // A window just past 90 days must not be (still distinguishes from an absurdly-long/no-op
     // config, i.e. proves the default really is finite and on the order of 90 days).
     assert!(

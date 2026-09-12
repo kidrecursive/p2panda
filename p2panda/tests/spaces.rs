@@ -1401,7 +1401,7 @@ mod global_groups_state_race {
     use std::time::Duration;
 
     use p2panda::network::MdnsDiscoveryMode;
-    use p2panda::{Hash, Node, NetworkId, Topic};
+    use p2panda::{Hash, NetworkId, Node, Topic};
     use p2panda_auth::AccessLevel;
     use p2panda_core::test_utils::setup_logging;
     use p2panda_spaces::AuthGroupState;
@@ -1464,10 +1464,7 @@ mod global_groups_state_race {
         // `Space::add`'s sibling mutators have a concurrent writer to race `Node::create_space`
         // against.
         let space_a_topic = Topic::random();
-        let (space_a, _space_a_rx) = control
-            .create_space::<String>(space_a_topic)
-            .await
-            .unwrap();
+        let (space_a, _space_a_rx) = control.create_space::<String>(space_a_topic).await.unwrap();
 
         space_a.add(actor_a.id(), AccessLevel::Read).await.unwrap();
 
@@ -1513,8 +1510,10 @@ mod global_groups_state_race {
                     .add(actor_new.id(), AccessLevel::Read)
                     .await
                     .unwrap_or_else(|err| {
-                        panic!("round {round}: new_space.add failed: {err} (this space's own \
-                                group Create was lost)")
+                        panic!(
+                            "round {round}: new_space.add failed: {err} (this space's own \
+                                group Create was lost)"
+                        )
                     });
             }
         })

@@ -256,7 +256,12 @@ where
     ///
     /// `author` scopes the chain walk to `operation`'s own author (see the module-level security
     /// note): only that author's own buffered entries can ever be released by this operation.
-    async fn pop_chain_after(&self, author: VerifyingKey, after: Hash, log_id: &L) -> Vec<Operation<E>> {
+    async fn pop_chain_after(
+        &self,
+        author: VerifyingKey,
+        after: Hash,
+        log_id: &L,
+    ) -> Vec<Operation<E>> {
         let mut buffer = self.buffer.lock().await;
         buffer.pop_from(author, Some(after), log_id.clone())
     }
@@ -436,7 +441,10 @@ mod tests {
         assert_eq!(ring.len(), 4);
 
         // Pop chain range from 3 on.
-        assert_eq!(ring.pop_from("alice", Some(3), "test-log"), vec![4, 5, 6, 7]);
+        assert_eq!(
+            ring.pop_from("alice", Some(3), "test-log"),
+            vec![4, 5, 6, 7]
+        );
         assert_eq!(ring.len(), 0);
     }
 
