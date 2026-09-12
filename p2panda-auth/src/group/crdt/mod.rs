@@ -1739,7 +1739,7 @@ pub(crate) mod tests {
         let y_iii_b = TestGroup::process(y_ii.clone(), &op4).unwrap();
         let y_iv_b = TestGroup::process(y_iii_b, &op3).unwrap();
 
-        for (_, y) in [y_iv_a, y_iv_b].into_iter().enumerate() {
+        for y in [y_iv_a, y_iv_b].into_iter() {
             let mut members = y.members(G1);
             members.sort();
             assert_eq!(members, vec![(ALICE, Access::manage())],);

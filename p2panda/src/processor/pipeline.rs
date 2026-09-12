@@ -573,7 +573,7 @@ mod tests {
             );
 
             event.orderer_args = OrdererArgs::Process {
-                dependencies: dependencies,
+                dependencies,
             };
 
             events.push(event);

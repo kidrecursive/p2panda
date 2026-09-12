@@ -892,7 +892,7 @@ mod tests {
         let mut peer_b = Peer::new(1).await;
         let mut peer_c = Peer::new(2).await;
 
-        let body = Body::from_bytes(&[0; 1000]);
+        let body = Body::from_bytes([0; 1000]);
 
         for _ in 0..100 {
             let _ = peer_a.create_operation(&body, 0).await;

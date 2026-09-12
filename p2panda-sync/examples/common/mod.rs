@@ -51,7 +51,7 @@ where
             .expect("example operations stay well under MAX_HEADER_ITEM_LEN");
 
         <SqliteStore as TopicStore<Topic, VerifyingKey, LogId>>::associate(
-            &store,
+            store,
             &topic,
             &verifying_key,
             &log_id,

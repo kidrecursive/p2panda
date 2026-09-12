@@ -180,9 +180,10 @@ impl NodeBuilder {
                 transport_info
                     .addresses
                     .iter()
-                    .find_map(|address| match address {
-                        TransportAddress::Iroh(endpoint_addr) => Some(endpoint_addr.clone()),
+                    .map(|address| match address {
+                        TransportAddress::Iroh(endpoint_addr) => endpoint_addr.clone(),
                     })
+                    .next()
             })
             .unwrap_or_else(|| EndpointAddr::new(from_verifying_key(node_id)));
         endpoint_addr = endpoint_addr.with_ip_addr(addr);

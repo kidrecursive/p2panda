@@ -261,8 +261,8 @@ mod tests {
         let pki = {
             let y = KeyRegistry::init();
             let y = KeyRegistry::add_longterm_bundle(y, member_id, bundle_1.clone()).unwrap();
-            let y = KeyRegistry::add_longterm_bundle(y, member_id, bundle_2).unwrap();
-            y
+            
+            KeyRegistry::add_longterm_bundle(y, member_id, bundle_2).unwrap()
         };
 
         // Registry returns bundle which has the "furthest" expiry date.
@@ -367,8 +367,8 @@ mod tests {
             let y = KeyRegistry::init();
             let y =
                 KeyRegistry::add_longterm_bundle_UNVERIFIED(y, member_id, invalid_bundle.clone());
-            let y = KeyRegistry::add_longterm_bundle_UNVERIFIED(y, member_id, valid_bundle.clone());
-            y
+            
+            KeyRegistry::add_longterm_bundle_UNVERIFIED(y, member_id, valid_bundle.clone())
         };
 
         assert_eq!(pki.longterm_bundles.get(&member_id).unwrap().len(), 2);

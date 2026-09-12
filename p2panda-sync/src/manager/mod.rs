@@ -461,7 +461,7 @@ mod tests {
 
         // Session A -> B
         let mut config = SessionConfig {
-            topic: topic.clone(),
+            topic,
             remote: peer_b.id(),
             live_mode: true,
         };
@@ -471,7 +471,7 @@ mod tests {
 
         // Session A -> C
         let mut config = SessionConfig {
-            topic: topic.clone(),
+            topic,
             remote: peer_c.id(),
             live_mode: true,
         };

@@ -74,7 +74,7 @@ fn any_header_conversions() {
     let hash = header.hash();
     assert!(header.verify());
 
-    let any_header = AnyHeader::try_from(header.clone()).unwrap();
+    let any_header = AnyHeader::from(header.clone());
     assert_eq!(any_header.hash(), hash);
     assert_eq!(any_header.size(), header.encode().len() as u32);
 

@@ -128,9 +128,9 @@ async fn get_log_size() {
 
     assert_eq!(operations_num, 2);
 
-    let expected_size = operation_1.header.size() as u32
+    let expected_size = operation_1.header.size()
         + operation_1.header.payload_size
-        + operation_2.header.size() as u32
+        + operation_2.header.size()
         + operation_2.header.payload_size;
     assert_eq!(size, expected_size);
 }
@@ -193,9 +193,9 @@ async fn get_log_entries() {
         operation_4,
         operation_5,
     ];
-    for index in 0..=4 {
+    for expected_op in &expected {
         let StreamItem { entry, .. } = log_entries.next().await.unwrap().unwrap();
-        assert_eq!(entry, expected[index].clone().into());
+        assert_eq!(entry, expected_op.clone().into());
     }
 
     assert!(log_entries.next().await.is_none());

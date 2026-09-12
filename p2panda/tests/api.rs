@@ -65,8 +65,8 @@ mod api {
 
             tokio::spawn(async move {
                 tx.publish("Hello, Icebear!".into()).await.unwrap();
-                let message = rx.next().await.unwrap();
-                message
+                
+                rx.next().await.unwrap()
             })
         };
 
@@ -697,12 +697,10 @@ mod connection_authorisation {
                 topic,
                 node,
             }) = event
-            {
-                if node == icebear.id() && topic == chat_id {
+                && node == icebear.id() && topic == chat_id {
                     received_event = true;
                     break;
                 }
-            }
         }
 
         assert!(received_event);

@@ -82,7 +82,7 @@ mod tests {
     fn zero_byte_body() {
         let signing_key = SigningKey::generate();
         let header = Header::builder()
-            .body(&[])
+            .body([])
             .build(&signing_key, ())
             .unwrap();
 

@@ -173,7 +173,7 @@ impl TodoList {
             .map(|item| item.id)
     }
 
-    pub fn create(&mut self, description: &str) -> TodoEvent {
+    pub fn create(&self, description: &str) -> TodoEvent {
         TodoEvent {
             id: Topic::random().into(),
             kind: TodoEventKind::Set {
@@ -182,7 +182,7 @@ impl TodoList {
         }
     }
 
-    pub fn update(&mut self, id: TodoItemId, description: &str) -> Result<TodoEvent> {
+    pub fn update(&self, id: TodoItemId, description: &str) -> Result<TodoEvent> {
         let Some(item) = self.items.iter().find(|item| item.id == id) else {
             return Err(format!("unknown item with id {id}").into());
         };
@@ -195,7 +195,7 @@ impl TodoList {
         })
     }
 
-    pub fn delete(&mut self, id: TodoItemId) -> Result<TodoEvent> {
+    pub fn delete(&self, id: TodoItemId) -> Result<TodoEvent> {
         let Some(item) = self.items.iter().find(|item| item.id == id) else {
             return Err(format!("unknown item with id {id}").into());
         };
@@ -332,8 +332,8 @@ async fn main() -> Result<()> {
                     };
 
                     let mut description = description.to_string();
-                    while let Some(remainder) = parts.next() {
-                        description.push_str(" ");
+                    for remainder in parts {
+                        description.push(' ');
                         description.push_str(remainder);
                     }
 

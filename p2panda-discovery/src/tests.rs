@@ -110,7 +110,7 @@ impl TestNode {
         let (mut bob_tx, bob_rx) = mpsc::channel(16);
 
         let bob_handle = tokio::task::spawn_local(async move {
-            let mut alice_rx = alice_rx.map(|message| Ok::<_, ()>(message));
+            let mut alice_rx = alice_rx.map(Ok::<_, ()>);
             let Ok(result) = bob_protocol.bob(&mut bob_tx, &mut alice_rx).await else {
                 panic!("running bob protocol failed");
             };
@@ -118,7 +118,7 @@ impl TestNode {
         });
 
         // Wait until Alice has finished and store their results
-        let mut bob_rx = bob_rx.map(|message| Ok::<_, ()>(message));
+        let mut bob_rx = bob_rx.map(Ok::<_, ()>);
         let Ok(alice_result) = alice_protocol.alice(&mut alice_tx, &mut bob_rx).await else {
             panic!("running alice protocol failed");
         };

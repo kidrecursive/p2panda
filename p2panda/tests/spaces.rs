@@ -93,11 +93,9 @@ mod spaces_api {
                 inner: InnerGroupEvent::Created { .. },
                 ..
             } = event
-            {
-                if group_id == penguin.id() {
+                && group_id == penguin.id() {
                     break;
-                }
-            };
+                };
         }
 
         // Penguin mobile receives the group.
@@ -107,11 +105,9 @@ mod spaces_api {
                 inner: InnerGroupEvent::Created { .. },
                 ..
             } = event
-            {
-                if group_id == penguin.id() {
+                && group_id == penguin.id() {
                     break;
-                }
-            };
+                };
         }
 
         panda_space.add(penguin.id(), AccessLevel::Read).await?;
@@ -425,11 +421,9 @@ mod spaces_repair_task {
                 inner: InnerGroupEvent::Created { .. },
                 ..
             } = event
-            {
-                if group_id == penguin_group.id() {
+                && group_id == penguin_group.id() {
                     break;
-                }
-            };
+                };
         }
 
         // Penguin receives the group.
@@ -439,11 +433,9 @@ mod spaces_repair_task {
                 inner: InnerGroupEvent::Created { .. },
                 ..
             } = event
-            {
-                if group_id == penguin_group.id() {
+                && group_id == penguin_group.id() {
                     break;
-                }
-            };
+                };
         }
         // We expect panda to be able to add penguin group as a space member now.
         panda_space
@@ -506,11 +498,9 @@ mod spaces_repair_task {
                 inner: InnerGroupEvent::Created { .. },
                 ..
             } = event
-            {
-                if group_id == penguin_group.id() {
+                && group_id == penguin_group.id() {
                     break;
-                }
-            };
+                };
         }
 
         // We expect panda to be able to add penguin group to the space.
@@ -592,11 +582,10 @@ mod spaces_api_validation {
         let (tiger_space, mut tiger_rx) = tiger.space::<String>(topic).await.unwrap();
 
         while let Some(event) = panda_rx.next().await {
-            if let StreamEvent::Member(verifying_key) = event {
-                if verifying_key == tiger.id() {
+            if let StreamEvent::Member(verifying_key) = event
+                && verifying_key == tiger.id() {
                     break;
-                }
-            };
+                };
         }
 
         // Panda adds tiger with read-only access.
@@ -697,11 +686,9 @@ mod spaces_api_validation {
                 inner: InnerGroupEvent::Created { .. },
                 ..
             }) = lion_system_rx.next().await
-            {
-                if group_id == panda_group.id() {
+                && group_id == panda_group.id() {
                     break;
-                }
-            };
+                };
         }
 
         // Tiger receives the group event on their system stream.
@@ -711,11 +698,9 @@ mod spaces_api_validation {
                 inner: InnerGroupEvent::Created { .. },
                 ..
             }) = tiger_system_rx.next().await
-            {
-                if group_id == panda_group.id() {
+                && group_id == panda_group.id() {
                     break;
-                }
-            };
+                };
         }
 
         // Tiger isn't a recognized group actor.
@@ -791,11 +776,9 @@ mod spaces_events {
                 inner: InnerGroupEvent::Created { .. },
                 ..
             }) = penguin_laptop_system_rx.next().await
-            {
-                if group_id == device_group.id() {
+                && group_id == device_group.id() {
                     break;
-                }
-            };
+                };
         }
 
         // Panda receives the device group event on their system stream.
@@ -805,11 +788,9 @@ mod spaces_events {
                 inner: InnerGroupEvent::Created { .. },
                 ..
             }) = panda_system_rx.next().await
-            {
-                if group_id == device_group.id() {
+                && group_id == device_group.id() {
                     break;
-                }
-            };
+                };
         }
 
         // Panda creates a team group with Penguin's device group as a member.
@@ -831,11 +812,9 @@ mod spaces_events {
                 inner: InnerGroupEvent::Created { .. },
                 ..
             }) = event
-            {
-                if group_id == team_group.id() {
+                && group_id == team_group.id() {
                     break;
-                }
-            };
+                };
         }
 
         // Panda receives the team group event on their system stream.
@@ -845,11 +824,9 @@ mod spaces_events {
                 inner: InnerGroupEvent::Created { .. },
                 ..
             }) = panda_system_rx.next().await
-            {
-                if group_id == team_group.id() {
+                && group_id == team_group.id() {
                     break;
-                }
-            };
+                };
         }
 
         // Panda subscribes to the group event stream.
@@ -942,11 +919,10 @@ mod filtered_messages {
         let (penguin_space, mut penguin_rx) = penguin.space::<SecretData>(topic).await.unwrap();
 
         while let Some(event) = panda_rx.next().await {
-            if let StreamEvent::Member(member) = event {
-                if member == penguin.id() {
+            if let StreamEvent::Member(member) = event
+                && member == penguin.id() {
                     break;
-                }
-            };
+                };
         }
 
         // Panda adds Penguin as a member of the space.
@@ -1068,11 +1044,10 @@ mod filtered_messages {
         let (penguin_space, mut penguin_rx) = penguin.space::<SecretData>(topic).await.unwrap();
 
         while let Some(event) = panda_rx.next().await {
-            if let StreamEvent::Member(member) = event {
-                if member == penguin.id() {
+            if let StreamEvent::Member(member) = event
+                && member == penguin.id() {
                     break;
-                }
-            };
+                };
         }
 
         // Panda adds Penguin as a member of the space.
@@ -1119,11 +1094,10 @@ mod filtered_messages {
         let (_tiger_space, mut tiger_rx) = tiger.space::<SecretData>(topic).await.unwrap();
 
         while let Some(event) = panda_rx.next().await {
-            if let StreamEvent::Member(member) = event {
-                if member == tiger.id() {
+            if let StreamEvent::Member(member) = event
+                && member == tiger.id() {
                     break;
-                }
-            };
+                };
         }
 
         // Panda adds Tiger as a member of the space.
@@ -1286,11 +1260,10 @@ mod connection_authorisation {
         let (penguin_space, mut penguin_rx) = penguin.space::<SecretData>(topic).await.unwrap();
 
         while let Some(event) = panda_rx.next().await {
-            if let StreamEvent::Member(member) = event {
-                if member == penguin.id() {
+            if let StreamEvent::Member(member) = event
+                && member == penguin.id() {
                     break;
-                }
-            };
+                };
         }
 
         // Panda adds Penguin as a member of the space.

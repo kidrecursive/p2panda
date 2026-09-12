@@ -20,28 +20,32 @@
 //! `live_push_republish.rs`): mDNS-based node discovery hangs in this project's sandboxed
 //! environment.
 
+#[cfg(feature = "test-hooks")]
 use std::io::Write;
+#[cfg(feature = "test-hooks")]
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+#[cfg(feature = "test-hooks")]
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
+#[cfg(feature = "test-hooks")]
 use p2panda::network::MdnsDiscoveryMode;
-use p2panda::spaces::InnerGroupEvent;
-use p2panda::streams::{StreamEvent, SystemEvent};
-use p2panda::{AccessLevel, Credentials, Node};
-use p2panda_core::Topic;
+#[cfg(feature = "test-hooks")]
+use p2panda::{Credentials, Node};
+#[cfg(feature = "test-hooks")]
 use serde::{Deserialize, Serialize};
-use tokio_stream::StreamExt;
+#[cfg(feature = "test-hooks")]
 use tracing_subscriber::fmt::MakeWriter;
 
 /// Binds an ephemeral UDP socket on localhost to reserve a free port, then immediately drops it so
 /// the caller can pass the address to `bind_port_v4`/`bootstrap_addr` (mirrors
 /// `fork_bootstrap_addr.rs`'s `reserve_localhost_addr`).
+#[cfg(feature = "test-hooks")]
 fn reserve_localhost_addr() -> SocketAddr {
     let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind ephemeral UDP port");
     socket.local_addr().expect("resolve bound local address")
 }
 
+#[cfg(feature = "test-hooks")]
 async fn spawn_node_with_bootstrap(bootstrap: Option<(p2panda::NodeId, SocketAddr)>) -> Node {
     let mut builder = p2panda::builder().mdns_mode(MdnsDiscoveryMode::Disabled);
     if let Some((node_id, addr)) = bootstrap {
@@ -50,6 +54,7 @@ async fn spawn_node_with_bootstrap(bootstrap: Option<(p2panda::NodeId, SocketAdd
     builder.spawn().await.expect("node spawns")
 }
 
+#[cfg(feature = "test-hooks")]
 async fn spawn_bootstrap_node(addr: SocketAddr) -> Node {
     let credentials = Credentials::generate();
     p2panda::builder()
@@ -64,9 +69,11 @@ async fn spawn_bootstrap_node(addr: SocketAddr) -> Node {
 
 /// Writes captured tracing output into a shared in-memory buffer instead of stderr, so the test
 /// can assert on log content directly (`ooo_park`'s absence/presence) rather than parsing files.
+#[cfg(feature = "test-hooks")]
 #[derive(Clone, Default)]
 struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
 
+#[cfg(feature = "test-hooks")]
 impl Write for CaptureWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if std::env::var("SQT_DEBUG_TEE").is_ok() {
@@ -84,6 +91,7 @@ impl Write for CaptureWriter {
     }
 }
 
+#[cfg(feature = "test-hooks")]
 impl<'a> MakeWriter<'a> for CaptureWriter {
     type Writer = CaptureWriter;
 
@@ -92,6 +100,7 @@ impl<'a> MakeWriter<'a> for CaptureWriter {
     }
 }
 
+#[cfg(feature = "test-hooks")]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct Empty;
 

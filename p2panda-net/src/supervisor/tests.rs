@@ -29,8 +29,8 @@ impl TestApi {
 
     pub async fn echo(&self, value: u64) -> u64 {
         let inner = self.actor_ref.read().await;
-        let response = call!(inner.as_ref().unwrap(), ToTestActor::Echo, value).unwrap();
-        response
+        
+        call!(inner.as_ref().unwrap(), ToTestActor::Echo, value).unwrap()
     }
 
     pub async fn panic(&self) {

@@ -442,11 +442,10 @@ async fn resync_replaces_live_session_recovering_late_association() {
     let found = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let event = bob_subscription.next().await.unwrap().unwrap();
-            if let Event::OperationReceived { operation, .. } = event.event {
-                if operation.hash == new_header.hash() {
+            if let Event::OperationReceived { operation, .. } = event.event
+                && operation.hash == new_header.hash() {
                     return;
                 }
-            }
         }
     })
     .await;
@@ -515,7 +514,7 @@ async fn panic_on_sink_closure_after_error_regression() {
     let mut peer = Peer::new(0).await;
     peer.associate(&topic, &Logs::default()).await;
 
-    let (session, _events_rx, _live_tx) = peer.topic_sync_protocol(topic.clone(), true);
+    let (session, _events_rx, _live_tx) = peer.topic_sync_protocol(topic, true);
 
     let acceptor = Endpoint::bind(presets::Minimal).await.unwrap();
     let acceptor_router = Router::builder(acceptor)

@@ -137,7 +137,7 @@ mod tests {
         // Backoff should be at initial value in the beginning.
         assert_eq!(backoff.value, config.initial_value);
 
-        let mut last_value = backoff.value.clone();
+        let mut last_value = backoff.value;
         let mut last_increment = Duration::default();
         for _ in 0..10 {
             backoff.increment();
@@ -153,7 +153,7 @@ mod tests {
             assert_ne!(backoff.value - last_value, last_increment);
 
             last_increment = backoff.value - last_value;
-            last_value = backoff.value.clone();
+            last_value = backoff.value;
         }
 
         // Force backoff to reach maximum by incrementing it many times.
@@ -171,7 +171,7 @@ mod tests {
         let mut backoff = Backoff::new(config.clone(), rng);
 
         for _ in 0..10 {
-            let last_reset_after = backoff.reset_after.clone();
+            let last_reset_after = backoff.reset_after;
             backoff.reset();
 
             // Reset should bring up a new, random "reset_after" value.
@@ -185,7 +185,7 @@ mod tests {
             assert!(backoff.reset_after <= config.max_reset);
         }
 
-        let last_reset_after = backoff.reset_after.clone();
+        let last_reset_after = backoff.reset_after;
 
         // Advance time to a moment right _before_ we want to reset.
         MockClock::advance(config.min_reset - Duration::from_secs(1));

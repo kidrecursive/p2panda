@@ -245,9 +245,15 @@ mod tests {
         assert!(root_access >= private_access);
         assert!(root_access >= public_access);
 
-        // Unrelated paths are not comparable.
-        assert!(!(private_access >= public_access));
-        assert!(!(private_access <= public_access));
+        // Unrelated paths are not comparable: `PartialOrd` here is a genuine partial order (not
+        // every pair has an ordering), so `!(a >= b)` is NOT equivalent to `a < b` -- clippy's
+        // `nonminimal_bool` suggestion assumes a total order and is wrong for this type; both
+        // assertions below must stay in the negated form to actually test incomparability.
+        #[allow(clippy::nonminimal_bool)]
+        {
+            assert!(!(private_access >= public_access));
+            assert!(!(private_access <= public_access));
+        }
 
         let read_access_to_root =
             Access::read().with_conditions(PathCondition("/root".to_string()));

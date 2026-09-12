@@ -138,7 +138,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Parse text commands into space membership actions and call related space API methods.
     while let Some(str) = line_rx.recv().await {
-        let action = match parse_action(str).await {
+        let action = match parse_action(str) {
             Ok(action) => action,
             Err(err) => {
                 println!("invalid command: {err}");
@@ -189,7 +189,7 @@ fn input_loop(line_tx: mpsc::Sender<String>) -> Result<(), std::io::Error> {
         stdin.read_line(&mut buffer)?;
         line_tx
             .blocking_send(buffer.trim().to_string())
-            .map_err(|err| std::io::Error::other(err))?;
+            .map_err(std::io::Error::other)?;
         buffer.clear();
     }
 }
@@ -208,7 +208,7 @@ enum Action {
 }
 
 /// Parse CLI text into an action.
-async fn parse_action(str: String) -> Result<Action, ParseActionError> {
+fn parse_action(str: String) -> Result<Action, ParseActionError> {
     if let Some(str) = str.strip_prefix("add") {
         let str = str.trim();
         let mut args: VecDeque<&str> = str.split(" ").filter(|s| !s.is_empty()).collect();

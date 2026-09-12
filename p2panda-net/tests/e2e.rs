@@ -28,10 +28,10 @@ async fn gossip_and_sync_with_same_topic() {
 
     // Panda waits for Penguin to send something.
     let panda_gossip_task = tokio::spawn(async move {
-        while let Some(Ok(bytes)) = panda_gossip_rx.next().await {
+        if let Some(Ok(bytes)) = panda_gossip_rx.next().await {
             return Some(bytes);
         }
-        return None;
+        None
     });
 
     // Subscribe to sync topic to receive (eventually consistent) messages.
@@ -45,7 +45,7 @@ async fn gossip_and_sync_with_same_topic() {
                 return Some(operation);
             }
         }
-        return None;
+        None
     });
 
     // ૮(•͈⌔•͈)ა <- Penguin

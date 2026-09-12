@@ -88,7 +88,7 @@ impl Node {
 
     async fn create_operation(&self, topic: Topic, body: &[u8]) -> Result<AnyOperation> {
         let operation =
-            crate::common::create_operation(&self.store, &self.signing_key, topic, &body).await?;
+            crate::common::create_operation(&self.store, &self.signing_key, topic, body).await?;
         Ok(operation)
     }
 
@@ -111,7 +111,7 @@ impl Node {
         let their_log_heights = &announcement.log_heights;
         let our_log_heights = get_topic_log_heights(&self.store, &topic).await?;
 
-        let diff = compare(&our_log_heights, &their_log_heights);
+        let diff = compare(&our_log_heights, their_log_heights);
         Ok(log_ranges(&self.store, diff))
     }
 

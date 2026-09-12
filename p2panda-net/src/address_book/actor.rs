@@ -398,13 +398,13 @@ mod tests {
             .unwrap();
 
         // Insert new node info.
-        let node_info = NodeInfo::new(args.verifying_key.clone());
+        let node_info = NodeInfo::new(args.verifying_key);
         let result = call!(actor, ToAddressBookActor::InsertNodeInfo, node_info).unwrap();
         assert!(result.is_ok());
         assert!(result.unwrap());
 
         // Overwriting node info should return "false".
-        let mut node_info = NodeInfo::new(args.verifying_key.clone());
+        let mut node_info = NodeInfo::new(args.verifying_key);
         node_info.bootstrap = true;
         let result = call!(actor, ToAddressBookActor::InsertNodeInfo, node_info).unwrap();
         assert!(result.is_ok());
@@ -414,7 +414,7 @@ mod tests {
         let result = call!(
             actor,
             ToAddressBookActor::NodeInfo,
-            args.verifying_key.clone()
+            args.verifying_key
         )
         .unwrap()
         .expect("node info exists in store");
@@ -424,12 +424,12 @@ mod tests {
         // Inserting invalid node info should fail.
         let node_info = {
             NodeInfo {
-                node_id: args.verifying_key.clone(),
+                node_id: args.verifying_key,
                 bootstrap: false,
                 transports: Some({
                     let mut unsigned = UnsignedTransportInfo::new();
                     unsigned.add_addr(TransportAddress::from_iroh(
-                        args.verifying_key.clone(),
+                        args.verifying_key,
                         Some("https://my.relay.net".parse().unwrap()),
                         [],
                     ));
@@ -445,7 +445,7 @@ mod tests {
         assert!(result.is_err());
 
         // Inserting transport info should not overwrite "local" data.
-        let mut node_info = NodeInfo::new(args.verifying_key.clone());
+        let mut node_info = NodeInfo::new(args.verifying_key);
         node_info.bootstrap = true;
         let result = call!(actor, ToAddressBookActor::InsertNodeInfo, node_info).unwrap();
         assert!(result.is_ok());
@@ -453,7 +453,7 @@ mod tests {
         let transport_info = {
             let mut unsigned = UnsignedTransportInfo::new();
             unsigned.add_addr(TransportAddress::from_iroh(
-                args.verifying_key.clone(),
+                args.verifying_key,
                 Some("https://my.relay.net".parse().unwrap()),
                 [],
             ));
@@ -462,7 +462,7 @@ mod tests {
         let result = call!(
             actor,
             ToAddressBookActor::InsertTransportInfo,
-            args.verifying_key.clone(),
+            args.verifying_key,
             transport_info.into()
         )
         .unwrap();
@@ -472,7 +472,7 @@ mod tests {
         let result = call!(
             actor,
             ToAddressBookActor::NodeInfo,
-            args.verifying_key.clone()
+            args.verifying_key
         )
         .unwrap()
         .expect("node info exists in store");
@@ -485,7 +485,7 @@ mod tests {
         let transport_info = {
             let mut unsigned = UnsignedTransportInfo::new();
             unsigned.add_addr(TransportAddress::from_iroh(
-                args.verifying_key.clone(),
+                args.verifying_key,
                 Some("https://my.relay.net".parse().unwrap()),
                 [],
             ));
@@ -497,7 +497,7 @@ mod tests {
         let result = call!(
             actor,
             ToAddressBookActor::InsertTransportInfo,
-            args.verifying_key.clone(),
+            args.verifying_key,
             transport_info.into()
         )
         .unwrap();

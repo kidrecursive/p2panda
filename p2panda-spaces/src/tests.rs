@@ -280,7 +280,7 @@ async fn add_member_to_space() {
     ));
 
     // Orderer states have been updated.
-    let y = manager.get_space_state(&space_id).await.unwrap().unwrap();
+    let y = manager.get_space_state(space_id).await.unwrap().unwrap();
     assert_eq!(vec![message_04.hash()], y.orderer.heads());
 
     let groups_y = manager.get_groups_state().await.unwrap();
@@ -462,7 +462,7 @@ async fn add_pull_member_to_space() {
         groups_y.inner.heads(&[*group_id])
     );
 
-    let y = manager.get_space_state(&space_id).await.unwrap().unwrap();
+    let y = manager.get_space_state(space_id).await.unwrap().unwrap();
     // Encryption order has been updated.
     assert_eq!(vec![message_04.hash()], y.orderer.heads());
 }
@@ -1360,7 +1360,7 @@ async fn events() {
     // Test basic expected event types.
     let mut all_bob_events = vec![];
     for (idx, message) in alice_messages.iter().enumerate() {
-        bob.persist_operation(&message).await.unwrap();
+        bob.persist_operation(message).await.unwrap();
         let bob_events = bob_manager.process_persisted(message).await.unwrap();
         all_bob_events.extend(bob_events.clone());
         match idx {
@@ -1597,7 +1597,7 @@ async fn repair_space() {
 
     // Trigger repair of the space.
     let messages = alice_manager
-        .repair_spaces_persisted(&vec![space_id])
+        .repair_spaces_persisted(&[space_id])
         .await
         .unwrap();
     let message_05 = messages[0].clone();
@@ -1605,7 +1605,7 @@ async fn repair_space() {
     // Alice's space members now contain Claire (the space was repaired).
     let space = alice_manager.space(space_id).await.unwrap().unwrap();
     let mut members = space.members().await.unwrap();
-    members.sort_by(|(actor_a, _), (actor_b, _)| actor_a.cmp(actor_b));
+    members.sort_by_key(|(actor_a, _)| *actor_a);
     let expected_members = vec![
         (alice_id, Access::manage()),
         (bob_id, Access::read()),
@@ -1626,7 +1626,7 @@ async fn repair_space() {
     // Bob now knows about the space and has correct members.
     let space = bob_manager.space(space_id).await.unwrap().unwrap();
     let mut members = space.members().await.unwrap();
-    members.sort_by(|(actor_a, _), (actor_b, _)| actor_a.cmp(actor_b));
+    members.sort_by_key(|(actor_a, _)| *actor_a);
     assert_eq!(members, expected_members);
 }
 
@@ -1651,9 +1651,11 @@ async fn repair_forges_pointers_only_from_the_given_snapshot() {
     let alice = TestPeer::new(0).await;
     let bob = <TestPeer>::new(1).await;
     let claire = <TestPeer>::new(2).await;
+    let dave = <TestPeer>::new(3).await;
 
     let bob_id = bob.manager.id();
     let claire_id = claire.manager.id();
+    let dave_id = dave.manager.id();
 
     let alice_manager = alice.manager.clone();
     let bob_manager = bob.manager.clone();
@@ -1677,6 +1679,10 @@ async fn repair_forges_pointers_only_from_the_given_snapshot() {
         .unwrap();
 
     // Alice: Create Group with Bob as a manager, then a Space with that group as a read member.
+    // Creating the space also forges the space's own auth-group op into the SAME global groups
+    // state (`Manager::create_space_persisted` -> `set_groups_state`) -- that op, plus this
+    // group's own Create, are already known to the space's own stored `groups_y` copy the moment
+    // it exists, so neither is a candidate for a non-vacuous repair below.
     let (group, message_01, _) = alice_manager
         .create_group_persisted(&[(bob_id, Access::manage())])
         .await
@@ -1690,41 +1696,58 @@ async fn repair_forges_pointers_only_from_the_given_snapshot() {
         .unwrap();
     drop(space);
 
-    // Bob learns about the group (but not the space yet) and concurrently adds Claire to it.
+    // Bob learns about the group (but not the space yet) and adds Claire to it. Alice processes
+    // this op into her manager's global groups state, but it is never applied to the SPACE's own
+    // stored `groups_y` copy -- only `Space::repair` does that -- so it is exactly the kind of
+    // "known globally, not yet known to the space" op `repair` exists to republish.
     bob.persist_operation(&message_01).await.unwrap();
     bob_manager.process_persisted(&message_01).await.unwrap();
-    let group = bob_manager.group(member_group_id).await.unwrap().unwrap();
-    let bob_message_01 = group
+    let group_on_bob = bob_manager.group(member_group_id).await.unwrap().unwrap();
+    let claire_add = group_on_bob
         .add_persisted(claire_id, Access::read())
         .await
         .unwrap();
-    drop(group);
+    drop(group_on_bob);
 
-    // Take a snapshot of the global groups state BEFORE alice learns about Bob's concurrent add --
-    // this simulates the earlier read in `p2panda::spaces::repair::repair_space` that the raw-op
-    // republish list would be built from.
+    alice.persist_operation(&claire_add).await.unwrap();
+    alice_manager.process_persisted(&claire_add).await.unwrap();
+
+    // Take a snapshot of the global groups state now -- it includes Claire's add, but not
+    // anything that happens afterwards. This simulates the earlier read in
+    // `p2panda::spaces::repair::repair_space` that the raw-op republish list would be built from.
     let stale_snapshot = alice_manager.get_groups_state().await.unwrap();
+    assert!(
+        stale_snapshot
+            .inner
+            .operations
+            .contains_key(&claire_add.hash()),
+        "sanity: the stale snapshot must include Claire's add -- it's the op this test expects \
+         `repair` to produce a pointer for"
+    );
+
+    // Bob concurrently adds Dave to the group too, AFTER the snapshot above was taken. Alice
+    // processes this into her live global state, advancing it past the stale snapshot.
+    let group_on_bob = bob_manager.group(member_group_id).await.unwrap().unwrap();
+    let dave_add = group_on_bob
+        .add_persisted(dave_id, Access::read())
+        .await
+        .unwrap();
+    drop(group_on_bob);
+
     assert!(
         !stale_snapshot
             .inner
             .operations
-            .contains_key(&bob_message_01.hash()),
-        "sanity: bob's concurrent add must not be in the stale snapshot yet"
+            .contains_key(&dave_add.hash()),
+        "sanity: Dave's concurrent add must not be in the stale snapshot yet"
     );
 
-    // Now alice processes Bob's concurrent add, advancing her live global state past the snapshot.
-    alice.persist_operation(&bob_message_01).await.unwrap();
-    alice_manager
-        .process_persisted(&bob_message_01)
-        .await
-        .unwrap();
+    alice.persist_operation(&dave_add).await.unwrap();
+    alice_manager.process_persisted(&dave_add).await.unwrap();
 
     let live_snapshot = alice_manager.get_groups_state().await.unwrap();
     assert!(
-        live_snapshot
-            .inner
-            .operations
-            .contains_key(&bob_message_01.hash()),
+        live_snapshot.inner.operations.contains_key(&dave_add.hash()),
         "sanity: alice's live global state has moved past the stale snapshot"
     );
 
@@ -1737,11 +1760,20 @@ async fn repair_forges_pointers_only_from_the_given_snapshot() {
         .await
         .unwrap();
 
+    assert!(
+        !messages.is_empty(),
+        "sanity: repair must actually produce republished messages for this scenario (a pointer \
+         for Claire's add, which the snapshot knows about but the space's own stored state does \
+         not), or the loop below asserts vacuously"
+    );
+
+    let mut saw_space_membership = false;
     for message in &messages {
         if let SpacesArgs::SpaceMembership {
             auth_message_id, ..
         } = message.borrow()
         {
+            saw_space_membership = true;
             assert!(
                 stale_snapshot
                     .inner
@@ -1754,12 +1786,17 @@ async fn repair_forges_pointers_only_from_the_given_snapshot() {
             );
             assert_ne!(
                 *auth_message_id,
-                bob_message_01.hash(),
-                "repair must not forge a pointer for Bob's concurrent add when repairing against \
+                dave_add.hash(),
+                "repair must not forge a pointer for Dave's concurrent add when repairing against \
                  the stale snapshot taken before that op was known"
             );
         }
     }
+    assert!(
+        saw_space_membership,
+        "repair produced no SpaceMembership message at all -- the assertions above would have \
+         passed vacuously without ever checking a pointer"
+    );
 }
 
 #[tokio::test]
@@ -1846,7 +1883,7 @@ async fn duplicate_auth_state_references() {
 
     // Trigger repair of the space.
     let messages = alice_manager
-        .repair_spaces_persisted(&vec![space_id])
+        .repair_spaces_persisted(&[space_id])
         .await
         .unwrap();
     let message_05 = messages[0].clone();
@@ -1875,7 +1912,7 @@ async fn duplicate_auth_state_references() {
 
     // Trigger repair of the space.
     let messages = bob_manager
-        .repair_spaces_persisted(&vec![space_id])
+        .repair_spaces_persisted(&[space_id])
         .await
         .unwrap();
     let _ = messages[0].clone();
@@ -2196,7 +2233,7 @@ async fn promote_demote() {
     // Bob receives the same events.
     let mut all_bob_events = vec![];
     for (idx, message) in alice_messages.iter().enumerate() {
-        bob.persist_operation(&message).await.unwrap();
+        bob.persist_operation(message).await.unwrap();
         let bob_events = bob_manager.process_persisted(message).await.unwrap();
         all_bob_events.extend(bob_events.clone());
         match idx {

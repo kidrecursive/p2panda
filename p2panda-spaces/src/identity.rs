@@ -366,7 +366,7 @@ mod tests {
             &bob_rng,
         )
         .unwrap();
-        let bob_id = bob_credentials.verifying_key().into();
+        let bob_id = bob_credentials.verifying_key();
 
         let bob_member = bob_identity_manager.me().await.unwrap();
         alice_identity_manager.process(&bob_member).await.unwrap();

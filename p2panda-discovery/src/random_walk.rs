@@ -347,8 +347,8 @@ mod tests {
         };
 
         tx_unwrap!(store, {
-            for idx in 0..NUM_NODES {
-                let node_id = node_ids[idx];
+            for node_id in node_ids.iter().take(NUM_NODES) {
+                let node_id = *node_id;
                 store
                     .insert_node_info(TestNodeInfo::new(node_id))
                     .await

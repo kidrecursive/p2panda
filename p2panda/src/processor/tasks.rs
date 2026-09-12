@@ -184,8 +184,8 @@ mod tests {
 
         // Check if all processes correctly received the result.
         let result = futures_util::future::join_all(futures).await;
-        for i in 0..10 {
-            assert_eq!(result[i].as_ref().unwrap(), &"yay, we did it!".to_string());
+        for item in result.iter().take(10) {
+            assert_eq!(item.as_ref().unwrap(), &"yay, we did it!".to_string());
         }
     }
 

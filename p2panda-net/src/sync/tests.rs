@@ -146,12 +146,12 @@ impl Protocol for FailingSyncProtocol {
 
         match self.behaviour {
             SyncBehaviour::Panic => panic!(),
-            SyncBehaviour::Error => return Err(SyncError::UnexpectedFailure),
+            SyncBehaviour::Error => Err(SyncError::UnexpectedFailure),
             SyncBehaviour::Wait => {
-                while let Some(_) = stream.next().await {}
-                return Err(SyncError::UnexpectedFailure);
+                while stream.next().await.is_some() {}
+                Err(SyncError::UnexpectedFailure)
             }
-            SyncBehaviour::Graceful | SyncBehaviour::CaughtUpThenGraceful => return Ok(()),
+            SyncBehaviour::Graceful | SyncBehaviour::CaughtUpThenGraceful => Ok(()),
         }
     }
 }

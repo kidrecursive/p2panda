@@ -640,7 +640,7 @@ pub mod tests {
         let mut peer = Peer::new(0).await;
         peer.associate(&topic, &BTreeMap::default()).await;
 
-        let (session, mut events_rx, _) = peer.topic_sync_protocol(topic.clone(), false);
+        let (session, mut events_rx, _) = peer.topic_sync_protocol(topic, false);
 
         let (_, remote_rx) = run_protocol_uni(
             session,
@@ -698,7 +698,7 @@ pub mod tests {
         let logs = BTreeMap::from([(peer.id(), vec![log_id])]);
         peer.associate(&topic, &logs).await;
 
-        let (session, mut events_rx, _) = peer.topic_sync_protocol(topic.clone(), false);
+        let (session, mut events_rx, _) = peer.topic_sync_protocol(topic, false);
 
         let (_, remote_rx) = run_protocol_uni(
             session,
@@ -810,10 +810,10 @@ pub mod tests {
         peer_a.associate(&topic, &logs).await;
 
         let (peer_a_session, mut peer_a_events_rx, _) =
-            peer_a.topic_sync_protocol(topic.clone(), false);
+            peer_a.topic_sync_protocol(topic, false);
 
         let (peer_b_session, mut peer_b_events_rx, _) =
-            peer_b.topic_sync_protocol(topic.clone(), false);
+            peer_b.topic_sync_protocol(topic, false);
 
         run_protocol(peer_a_session, peer_b_session).await.unwrap();
 
@@ -902,7 +902,7 @@ pub mod tests {
         let expected_bytes_sent = header_2.payload_size + header_2.size();
 
         let (protocol, mut events_rx, mut live_mode_tx) =
-            peer_a.topic_sync_protocol(topic.clone(), true);
+            peer_a.topic_sync_protocol(topic, true);
 
         live_mode_tx
             .send(ToSync::Payload(Operation {
@@ -1013,7 +1013,7 @@ pub mod tests {
         let expected_bytes_sent = header_2.payload_size + header_2.size();
 
         let (protocol, mut events_rx, mut live_mode_tx) =
-            peer_a.topic_sync_protocol(topic.clone(), true);
+            peer_a.topic_sync_protocol(topic, true);
 
         live_mode_tx
             .send(ToSync::Payload(Operation {
@@ -1123,7 +1123,7 @@ pub mod tests {
         let mut peer = Peer::new(0).await;
         peer.associate(&topic, &Default::default()).await;
 
-        let (session, mut events_rx, _live_tx) = peer.topic_sync_protocol(topic.clone(), true);
+        let (session, mut events_rx, _live_tx) = peer.topic_sync_protocol(topic, true);
 
         let messages = [TestTopicSyncMessage::Sync(LogSyncMessage::Have(
             BTreeMap::default(),
@@ -1131,7 +1131,7 @@ pub mod tests {
 
         let (mut local_message_tx, _remote_message_rx) = mpsc::channel(128);
         let (mut remote_message_tx, local_message_rx) = mpsc::channel(128);
-        let mut local_message_rx = local_message_rx.map(|message| Ok::<_, ()>(message));
+        let mut local_message_rx = local_message_rx.map(Ok::<_, ()>);
 
         for message in messages {
             remote_message_tx.send(message.to_owned()).await.unwrap();
@@ -1169,7 +1169,7 @@ pub mod tests {
         let mut peer = Peer::new(0).await;
         peer.associate(&topic, &Default::default()).await;
 
-        let (session, mut events_rx, _live_tx) = peer.topic_sync_protocol(topic.clone(), true);
+        let (session, mut events_rx, _live_tx) = peer.topic_sync_protocol(topic, true);
 
         let messages = [
             TestTopicSyncMessage::Sync(LogSyncMessage::Have(BTreeMap::default())),
@@ -1178,7 +1178,7 @@ pub mod tests {
 
         let (mut local_message_tx, _remote_message_rx) = mpsc::channel(128);
         let (mut remote_message_tx, local_message_rx) = mpsc::channel(128);
-        let mut local_message_rx = local_message_rx.map(|message| Ok::<_, ()>(message));
+        let mut local_message_rx = local_message_rx.map(Ok::<_, ()>);
 
         for message in messages {
             remote_message_tx.send(message.to_owned()).await.unwrap();

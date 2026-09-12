@@ -365,7 +365,7 @@ fn input_loop(line_tx: mpsc::Sender<String>) -> Result<(), std::io::Error> {
         stdin.read_line(&mut buffer)?;
         line_tx
             .blocking_send(buffer.clone())
-            .map_err(|err| std::io::Error::other(err))?;
+            .map_err(std::io::Error::other)?;
         buffer.clear();
     }
 }

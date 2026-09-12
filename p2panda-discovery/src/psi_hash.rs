@@ -454,7 +454,7 @@ mod tests {
         let (mut bob_tx, bob_rx) = mpsc::channel(16);
 
         let bob_handle = tokio::task::spawn(async move {
-            let mut alice_rx = alice_rx.map(|message| Ok::<_, ()>(message));
+            let mut alice_rx = alice_rx.map(Ok::<_, ()>);
             let Ok(result) = bob_protocol.bob(&mut bob_tx, &mut alice_rx).await else {
                 panic!("running bob protocol failed");
             };
@@ -462,7 +462,7 @@ mod tests {
         });
 
         // Wait until Alice has finished and store their results
-        let mut bob_rx = bob_rx.map(|message| Ok::<_, ()>(message));
+        let mut bob_rx = bob_rx.map(Ok::<_, ()>);
         let Ok(alice_result) = alice_protocol.alice(&mut alice_tx, &mut bob_rx).await else {
             panic!("running alice protocol failed");
         };
@@ -503,7 +503,7 @@ mod tests {
                 .await;
         });
 
-        let mut bob_rx = bob_rx.map(|message| Ok::<_, ()>(message));
+        let mut bob_rx = bob_rx.map(Ok::<_, ()>);
         let alice_result = alice_protocol.alice(&mut alice_tx, &mut bob_rx).await;
         let _bob_result = bob_handle.await;
         std::assert_matches!(alice_result, Err(PsiHashError::UnexpectedMessage));
@@ -537,7 +537,7 @@ mod tests {
                 .await;
         });
 
-        let mut alice_rx = alice_rx.map(|message| Ok::<_, ()>(message));
+        let mut alice_rx = alice_rx.map(Ok::<_, ()>);
         let bob_result = bob_protocol.bob(&mut bob_tx, &mut alice_rx).await;
         std::assert_matches!(bob_result, Err(PsiHashError::UnexpectedMessage));
     }
@@ -654,14 +654,14 @@ mod tests {
         let (mut bob_tx, bob_rx) = mpsc::channel(16);
 
         let bob_handle = tokio::task::spawn(async move {
-            let mut alice_rx = alice_rx.map(|message| Ok::<_, ()>(message));
+            let mut alice_rx = alice_rx.map(Ok::<_, ()>);
             let Ok(result) = bob_protocol.bob(&mut bob_tx, &mut alice_rx).await else {
                 panic!("running bob protocol failed");
             };
             result
         });
 
-        let mut bob_rx = bob_rx.map(|message| Ok::<_, ()>(message));
+        let mut bob_rx = bob_rx.map(Ok::<_, ()>);
         let Ok(alice_result) = alice_protocol.alice(&mut alice_tx, &mut bob_rx).await else {
             panic!("running alice protocol failed");
         };

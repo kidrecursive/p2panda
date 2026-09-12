@@ -166,7 +166,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut operations: HashMap<Topic, Logs> = HashMap::new();
 
     for topic in &topics_a {
-        let local_log_heights = get_topic_log_heights(&store_a, &topic).await?;
+        let local_log_heights = get_topic_log_heights(&store_a, topic).await?;
         let remote_log_heights = LogHeights::default();
         let diff = compare(&local_log_heights, &remote_log_heights);
         let mut operation_stream = log_ranges(&store_a, diff);
@@ -234,7 +234,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // B shares one topic with A.
-    let topic_a_and_b = topics_a.iter().next().unwrap().clone();
+    let topic_a_and_b = *topics_a.iter().next().unwrap();
     topics_b.insert(topic_a_and_b);
 
     for op_i in 0..2 {
@@ -272,7 +272,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 //
                 // The docs for `compare()` could maybe be updated to reflect this bidirectional
                 // nature.
-                compare(&their_log_heights, &our_log_heights);
+                compare(their_log_heights, &our_log_heights);
 
             // Get all stick operations for the announcement topic.
             let mut operations = HashMap::new();
@@ -377,7 +377,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         for announcement in &stick.announcements {
             println!("node_id: {}", announcement.node_id.fmt_short());
-            println!("topic: {}", announcement.topic.to_hex()[0..6].to_string());
+            println!("topic: {}", &announcement.topic.to_hex()[0..6]);
             println!("log heights:");
 
             for (author, log_heights) in &announcement.log_heights {
@@ -397,7 +397,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("\nOPERATIONS:\n");
 
         for (topic, logs) in &stick.operations {
-            println!("topic: {}", topic.to_hex()[0..6].to_string());
+            println!("topic: {}", &topic.to_hex()[0..6]);
 
             for ((author, log_id), operations) in logs {
                 println!(
@@ -421,7 +421,7 @@ async fn get_topic_log_heights(
     topic: &Topic,
 ) -> Result<LogHeights<VerifyingKey, LogId>, SqliteError> {
     let logs: LogIds = store.resolve(topic).await?;
-    let log_heights = get_log_heights(&store, &logs).await?;
+    let log_heights = get_log_heights(store, &logs).await?;
 
     Ok(log_heights)
 }

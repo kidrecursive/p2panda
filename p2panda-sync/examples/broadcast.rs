@@ -181,8 +181,8 @@ impl Digest<Hash> for Announcement {
 
 #[derive(Clone, Debug)]
 enum Message {
-    Operation(Topic, AnyOperation),
-    Announcement(Announcement),
+    Operation(Topic, Box<AnyOperation>),
+    Announcement(Box<Announcement>),
 }
 
 impl std::fmt::Display for Message {
@@ -265,7 +265,7 @@ impl Node {
 
                                 // TODO: Clone can be removed after OooBuffer PR was merged.
                                 let Ok(operation) =
-                                    Operation::<CustomExtensions>::try_from(operation.clone())
+                                    Operation::<CustomExtensions>::try_from((**operation).clone())
                                 else {
                                     // Custom header extensions did not match expected format.
                                     continue;
@@ -301,7 +301,8 @@ impl Node {
                                     let StreamItem {
                                         entry: operation, ..
                                     } = result.unwrap();
-                                    mesh.flood(Message::Operation(*topic, operation)).await;
+                                    mesh.flood(Message::Operation(*topic, Box::new(operation)))
+                                    .await;
                                 }
                             }
                         }
@@ -349,7 +350,7 @@ impl Node {
         let topics = self.topics.read().await;
 
         for topic in topics.iter() {
-            let all_log_heights = get_topic_log_heights(&self.store, &topic).await?;
+            let all_log_heights = get_topic_log_heights(&self.store, topic).await?;
 
             let announcement = Announcement {
                 topic: *topic,
@@ -363,7 +364,9 @@ impl Node {
                 announcement.hash().fmt_short()
             );
 
-            self.mesh.flood(Message::Announcement(announcement)).await;
+            self.mesh
+                .flood(Message::Announcement(Box::new(announcement)))
+                .await;
         }
 
         Ok(())
@@ -385,7 +388,9 @@ impl Node {
             operation.hash().fmt_short()
         );
 
-        self.mesh.flood(Message::Operation(topic, operation)).await;
+        self.mesh
+            .flood(Message::Operation(topic, Box::new(operation)))
+            .await;
 
         Ok(())
     }
@@ -398,8 +403,8 @@ async fn compute_diff(
     topic: Topic,
     their_log_heights: &LogHeights<VerifyingKey, LogId>,
 ) -> Result<OperationStream<LogId, SqliteError>> {
-    let our_log_heights = get_topic_log_heights(&store, &topic).await?;
-    let diff = compare(&our_log_heights, &their_log_heights);
+    let our_log_heights = get_topic_log_heights(store, &topic).await?;
+    let diff = compare(&our_log_heights, their_log_heights);
     Ok(log_ranges(store, diff))
 }
 

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::collections::VecDeque;
+use std::sync::Mutex;
 use std::task::Poll;
 
 use futures_test::task::noop_context;
@@ -8,28 +9,34 @@ use tokio::pin;
 use tokio::sync::Notify;
 
 /// Simple async queue which awaits when trying to pop from it while it is empty.
+///
+/// The queue itself lives behind a plain (non-async) `Mutex` that is only ever held for the
+/// duration of a `VecDeque` operation, never across an `.await` -- so callers can hold `&self`
+/// (not `&mut self`) and no `RefCell` borrow is ever alive while `pop`'s `notify.notified().await`
+/// suspends, which is what a `RefCell`-wrapped, `&mut self`-taking version of this type would
+/// require (clippy's `await_holding_refcell_ref`).
 #[derive(Debug, Default)]
 pub struct AsyncBuffer<T> {
-    queue: VecDeque<T>,
+    queue: Mutex<VecDeque<T>>,
     notify: Notify,
 }
 
 impl<T> AsyncBuffer<T> {
     pub fn new() -> Self {
         Self {
-            queue: VecDeque::new(),
+            queue: Mutex::new(VecDeque::new()),
             notify: Notify::new(),
         }
     }
 
-    pub fn push(&mut self, item: T) {
-        self.queue.push_back(item);
+    pub fn push(&self, item: T) {
+        self.queue.lock().unwrap().push_back(item);
         self.notify.notify_one(); // Wake up any pending recv
     }
 
-    pub async fn pop(&mut self) -> T {
+    pub async fn pop(&self) -> T {
         loop {
-            if let Some(item) = self.queue.pop_front() {
+            if let Some(item) = self.queue.lock().unwrap().pop_front() {
                 return item;
             }
 
@@ -39,8 +46,8 @@ impl<T> AsyncBuffer<T> {
     }
 
     #[allow(dead_code)]
-    pub fn try_pop(&mut self) -> Option<T> {
-        self.queue.pop_front()
+    pub fn try_pop(&self) -> Option<T> {
+        self.queue.lock().unwrap().pop_front()
     }
 }
 
