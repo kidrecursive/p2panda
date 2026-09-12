@@ -21,7 +21,7 @@ use crate::manager::ManagerError;
 use crate::member::Member;
 use crate::message::SpacesArgs;
 use crate::space::{Space, SpaceError};
-use crate::test_utils::{TestPeer, TestSpaceError};
+use crate::test_utils::{TestConditions, TestPeer, TestSpaceError};
 use crate::types::AuthGroupAction;
 
 #[tokio::test]
@@ -933,6 +933,140 @@ async fn space_from_existing_auth_state() {
     );
 }
 
+/// D3-n: `from_group` (via `create_space_persisted`, `include: &[]`) forges a `SpaceMembership`
+/// pointer for every operation in the copied global auth state -- not only the groups listed in
+/// `include` -- so a space's local `groups_y` (built from pointers alone) ends up structurally
+/// equal to the global state it was copied from. Before this fix, `from_group` only pointed
+/// `include`d groups even though the WHOLE global `groups_y` was copied into the new space
+/// (`y.groups_y = groups_y`), leaving sibling groups' ops in the copied state but never pointed --
+/// a non-owner peer that never directly joins those sibling groups (and so never processes their
+/// raw ops as its own auth messages) could never resolve them from the space's pointers alone.
+#[tokio::test]
+async fn from_group_forges_pointers_for_every_copied_group_op() {
+    let alice = TestPeer::new(0).await;
+    let bob = TestPeer::new(1).await;
+
+    alice
+        .manager
+        .register_member(&bob.manager.me().await.unwrap())
+        .await
+        .unwrap();
+    bob.manager
+        .register_member(&alice.manager.me().await.unwrap())
+        .await
+        .unwrap();
+
+    let alice_manager = alice.manager.clone();
+    let bob_manager = bob.manager.clone();
+    let alice_id = alice_manager.id();
+
+    // Alice already owns two sibling groups, A and B, neither of which will be `include`d in the
+    // space created below. Group A gets a second op (an `add`) so the test also proves
+    // dependency ordering (Create before later ops), not just presence.
+    let (group_a, message_a_create, _) = alice_manager
+        .create_group_persisted(&[(alice_id, Access::manage())])
+        .await
+        .unwrap();
+    let group_a_id = group_a.id();
+    let message_a_add = group_a
+        .add_persisted(bob.manager.id(), Access::read())
+        .await
+        .unwrap();
+
+    let (group_b, message_b_create, _) = alice_manager
+        .create_group_persisted(&[(alice_id, Access::manage())])
+        .await
+        .unwrap();
+    let group_b_id = group_b.id();
+
+    // Create a space with an empty `include` list -- neither A nor B is a member of it.
+    let space_id = SpaceId::digest(b"0");
+    let (_space, messages, _) = alice_manager
+        .create_space_persisted(space_id, &[])
+        .await
+        .unwrap();
+
+    // Every message except the first (the space's own group "create", a raw `Group` message) is
+    // a forged `SpaceMembership` pointer.
+    let pointer_auth_ids: Vec<_> = messages
+        .iter()
+        .filter_map(|message| match message.borrow() {
+            SpacesArgs::SpaceMembership {
+                auth_message_id, ..
+            } => Some(*auth_message_id),
+            _ => None,
+        })
+        .collect();
+
+    // Pointers exist for every op of A and B, not only the space's own "create".
+    assert!(pointer_auth_ids.contains(&message_a_create.hash()));
+    assert!(pointer_auth_ids.contains(&message_a_add.hash()));
+    assert!(pointer_auth_ids.contains(&message_b_create.hash()));
+
+    // Dependency order: A's "create" pointer precedes A's "add" pointer.
+    let a_create_pos = pointer_auth_ids
+        .iter()
+        .position(|id| id == &message_a_create.hash())
+        .unwrap();
+    let a_add_pos = pointer_auth_ids
+        .iter()
+        .position(|id| id == &message_a_add.hash())
+        .unwrap();
+    assert!(a_create_pos < a_add_pos);
+
+    // Bob never joins A or B, and never processes their raw ops as auth messages of his own --
+    // he only persists them (simulating the raw ops arriving via space-topic log sync, D3-l)
+    // and then processes the space's own messages (the raw group "create" for the space, plus
+    // every forged pointer).
+    bob.persist_operation(&message_a_create).await.unwrap();
+    bob.persist_operation(&message_a_add).await.unwrap();
+    bob.persist_operation(&message_b_create).await.unwrap();
+
+    for message in &messages {
+        bob.persist_operation(message).await.unwrap();
+        bob_manager.process_persisted(message).await.unwrap();
+    }
+
+    // Bob's space-local `groups_y` ends up equal to alice's global state: same set of processed
+    // operations, same membership for both sibling groups.
+    let bob_space_y = bob_manager
+        .get_space_state(&space_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let alice_groups_y = alice_manager.get_groups_state().await.unwrap();
+
+    let bob_ops: HashSet<_> = bob_space_y
+        .groups_y
+        .inner
+        .operations
+        .keys()
+        .copied()
+        .collect();
+    let alice_ops: HashSet<_> = alice_groups_y.inner.operations.keys().copied().collect();
+    assert_eq!(bob_ops, alice_ops);
+
+    let sorted_members = |mut members: Vec<_>| {
+        members.sort_by_key(|(id, _): &(crate::ActorId, Access<TestConditions>)| *id);
+        members
+    };
+    assert_eq!(
+        sorted_members(bob_space_y.groups_y.members(group_a_id)),
+        sorted_members(alice_groups_y.members(group_a_id))
+    );
+    assert_eq!(
+        sorted_members(bob_space_y.groups_y.members(group_b_id)),
+        sorted_members(alice_groups_y.members(group_b_id))
+    );
+
+    // Bob's own GLOBAL groups state only ever learned about the space's own group (the raw
+    // `Group` "create" message he processed directly) -- A and B were never joined directly by
+    // bob, only resolved as space-scoped pointers into the space-local `groups_y` above.
+    let bob_global_groups_y = bob_manager.get_groups_state().await.unwrap();
+    assert!(!bob_global_groups_y.groups_global().contains(&group_a_id));
+    assert!(!bob_global_groups_y.groups_global().contains(&group_b_id));
+}
+
 #[tokio::test]
 async fn create_group() {
     let alice = <TestPeer>::new(0).await;
@@ -1210,9 +1344,11 @@ async fn shared_auth_state() {
         .await
         .unwrap();
 
-    // One auth message, one space messages. There is no history included as there are no groups
-    // in the initial members.
-    assert_eq!(messages.len(), 2);
+    // One auth message, one space message for space 1's own group -- plus one forged pointer
+    // for space 0's own group, which already exists globally by this point. `include` was empty
+    // (no groups in space 1's initial members), but D3-n forges a pointer for every group in the
+    // copied snapshot regardless of `include`, so space 0's group is still pointed here.
+    assert_eq!(messages.len(), 3);
 
     // Create group A
     // ~~~~~~~~~~~~

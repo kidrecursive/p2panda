@@ -691,11 +691,19 @@ where
     /// method iterates through all existing auth messages and publishes these pointers to the
     /// space. None of the messages will contain encryption control messages as they were
     /// published before the space existed.
+    ///
+    /// `y.groups_y` below is set to a full copy of the global auth state (`groups_y`), not only
+    /// the `include`d groups -- so this method forges a pointer for every operation in that same
+    /// copied state (the full toposorted graph, not `toposort(include)`), keeping the space's
+    /// pointed set structurally equal to its copied local state (D3-n). `include` is still used
+    /// by the caller (`Space::create`) to select which groups the new space's initial membership
+    /// depends on; it plays no further role here now that every group in the snapshot gets a
+    /// pointer regardless of `include`.
     async fn from_group(
         manager_ref: Manager<S, F, C>,
         space_id: SpaceId,
         group_id: GroupId,
-        include: &[GroupId],
+        _include: &[GroupId],
     ) -> Result<(SpacesState<C>, Vec<F::Message>), SpaceError<F, C>> {
         // Instantiate empty space state.
         let mut y = { Self::get_or_init_state(space_id, group_id, manager_ref.clone()).await? };
@@ -709,7 +717,10 @@ where
         let groups_y = manager_ref.get_groups_state().await?;
         let mut manager = manager_ref.inner.write().await;
         let mut space_dependencies = vec![];
-        for id in groups_y.inner.toposort(include) {
+        // Forge a pointer for every group in the copied snapshot, not only `include`, so the
+        // space's pointed set matches `y.groups_y` (set below) exactly (D3-n).
+        let all_groups = groups_y.groups_global();
+        for id in groups_y.inner.toposort(&all_groups) {
             let operation = groups_y
                 .inner
                 .operations
