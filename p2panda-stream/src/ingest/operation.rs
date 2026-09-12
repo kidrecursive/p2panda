@@ -27,7 +27,14 @@ pub enum IngestResult<E> {
     Ordered(Vec<Operation<E>>),
 
     /// Out-of-order operation which was moved to internal buffer.
-    OutOfOrder,
+    OutOfOrder {
+        /// `true` when this (author, log_id) had no known predecessor at all (the log's local
+        /// frontier was unknown, and this isn't the log's own first operation, `seq_num == 0`) --
+        /// as opposed to the ordinary case of a known frontier with a specific gap to it. This
+        /// resting place was previously invisible: see `p2panda::stream::ooo_park` (D3-r, M4-14
+        /// round 2).
+        no_predecessor: bool,
+    },
 
     /// Operation was from before a pruning point and was ignored.
     Outdated,
@@ -121,7 +128,19 @@ where
                 IngestResult::Ordered(operations)
             }
 
-            OooResult::OutOfOrder => return Ok(IngestResult::OutOfOrder),
+            OooResult::OutOfOrder => {
+                // M4-14 round 2 (D3-r): distinguish "buffered, but we don't even know of any
+                // predecessor for this (author, log_id) yet" (`latest_header` was `None` and this
+                // isn't the log's own first operation) from the ordinary "buffered, waiting on a
+                // specific known gap" case. The former previously had no log line anywhere -- an
+                // op resting there looks identical to any other buffered op, but it will never be
+                // released by a later in-order arrival unlocking a chain (there's no chain to
+                // unlock): only the actual missing predecessor itself, arriving out of band,
+                // resolves it. See `p2panda::stream::ooo_park` in `p2panda`'s pipeline/stream
+                // layer, which logs this (with node_id) once the caller knows it.
+                let no_predecessor = latest_header.is_none() && operation.header.seq_num > 0;
+                return Ok(IngestResult::OutOfOrder { no_predecessor });
+            }
             OooResult::Outdated => return Ok(IngestResult::Outdated),
         }
     } else {
@@ -454,13 +473,26 @@ mod tests {
         let log_id = 0;
         let topic = Topic::random();
 
+        // D3-r: both of these arrive with an empty store (no predecessor known at all for this
+        // (author, log_id) yet, and neither is the log's own seq_num=0), so both must report
+        // `no_predecessor: true`.
         let result =
             ingest_operation(&store, Some(&ooo), &operation_1, &log_id, &topic, false).await;
-        assert_matches!(result, Ok(IngestResult::OutOfOrder));
+        assert_eq!(
+            result,
+            Ok(IngestResult::OutOfOrder {
+                no_predecessor: true
+            })
+        );
 
         let result =
             ingest_operation(&store, Some(&ooo), &operation_2, &log_id, &topic, false).await;
-        assert_matches!(result, Ok(IngestResult::OutOfOrder));
+        assert_eq!(
+            result,
+            Ok(IngestResult::OutOfOrder {
+                no_predecessor: true
+            })
+        );
 
         let result =
             ingest_operation(&store, Some(&ooo), &operation_0, &log_id, &topic, false).await;
@@ -471,6 +503,50 @@ mod tests {
                 operation_1,
                 operation_2
             ]))
+        );
+    }
+
+    #[tokio::test]
+    async fn ooo_operation_with_known_frontier_is_not_no_predecessor() {
+        // D3-r: an ordinary out-of-order arrival (the log's frontier IS known, there's just a
+        // specific gap to it) must report `no_predecessor: false` -- only the "we don't know of
+        // any predecessor at all yet" case (`ooo_operations` above) is `true`.
+        let log = TestLog::new();
+
+        let store = SqliteStore::temporary().await;
+        let ooo = OooBuffer::with_capacity(32);
+
+        let operation_0 = log.operation(b"Order", ());
+        let operation_1 = log.operation(b"Please", ());
+        let operation_2 = log.operation(b"!", ());
+
+        let log_id = 0;
+        let topic = Topic::random();
+
+        // Establish a known frontier at seq_num=0. A log's very first operation is itself routed
+        // through `push_and_pop_from` (its own `latest_header` is `None`), so it comes back as
+        // `Ordered([operation_0])` rather than `Inserted` -- see `ingest_reorders_out_of_order_
+        // operations` in `processor.rs` for the same, pre-existing (unrelated to this fix) detail.
+        let result =
+            ingest_operation(&store, Some(&ooo), &operation_0, &log_id, &topic, false).await;
+        assert_eq!(result, Ok(IngestResult::Ordered(vec![operation_0.clone()])));
+
+        // Skip seq_num=1 -- the frontier is known (seq_num=0), so this is an ordinary gap, not "no
+        // predecessor known at all".
+        let result =
+            ingest_operation(&store, Some(&ooo), &operation_2, &log_id, &topic, false).await;
+        assert_eq!(
+            result,
+            Ok(IngestResult::OutOfOrder {
+                no_predecessor: false
+            })
+        );
+
+        let result =
+            ingest_operation(&store, Some(&ooo), &operation_1, &log_id, &topic, false).await;
+        assert_eq!(
+            result,
+            Ok(IngestResult::Ordered(vec![operation_1, operation_2]))
         );
     }
 }

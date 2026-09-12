@@ -63,6 +63,12 @@ pub struct Node {
     // promote,demote}` (via `process_change`), which otherwise race on read-modify-write of the
     // same blob and silently drop one writer's change (docs/upstream/p2panda-local-control-lock.md).
     control_lock: Arc<tokio::sync::Mutex<()>>,
+    // M4-14 round 2 (D3-r): test-only hook letting a test deterministically hold `create_space`
+    // paused right after its topic stream opens (instead of a sleep), so a peer's live session on
+    // that topic can be forced to resolve inside the exact window under test. `None` in
+    // production and for every test that doesn't arm it -- a no-op.
+    #[cfg(feature = "test-hooks")]
+    test_create_space_pause_after_stream_open: Mutex<Option<Arc<tokio::sync::Notify>>>,
 }
 
 impl Node {
@@ -153,7 +159,23 @@ impl Node {
             events_rx: Mutex::new(events_rx),
             connection_authoriser,
             control_lock,
+            #[cfg(feature = "test-hooks")]
+            test_create_space_pause_after_stream_open: Mutex::new(None),
         })
+    }
+
+    /// Arms a one-shot pause right after the next `create_space` call's topic stream opens
+    /// (before that call returns), until the returned `Notify` is triggered. Test-only (D3-r,
+    /// M4-14 round 2): lets a test force a peer's live session on the new topic to resolve inside
+    /// a specific, otherwise-timing-dependent window, instead of a sleep.
+    #[cfg(feature = "test-hooks")]
+    pub fn test_pause_next_create_space_after_stream_open(&self) -> Arc<tokio::sync::Notify> {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        *self
+            .test_create_space_pause_after_stream_open
+            .lock()
+            .expect("test hook mutex poisoned") = Some(notify.clone());
+        notify
     }
 
     /// Returns a publisher and stateful subscriber for an eventually consistent event stream of
@@ -645,17 +667,67 @@ impl Node {
     {
         let space_id = space_id.into();
 
-        // Associate the space topic with our own member / key bundle log.
+        // Associate the space topic with our own member / key bundle log, and (D3-r) with every
+        // sibling group log already known globally at this moment -- mirroring `space_from`'s
+        // restart-path association loop (~L552-567) -- BEFORE the topic stream opens below.
+        //
+        // This must happen before `space_stream_from_inner`: a peer's live sync session resolves
+        // its offered log set the moment it connects to this topic, and that set is frozen for
+        // the lifetime of the session (D24-13; the D3-k `Initiate` dedupe skips the periodic
+        // resync while it lives). If a sibling group's log isn't associated with this space's
+        // topic until the post-persist loop further down (after the stream -- and therefore any
+        // peer's session -- can already be open), a peer that resolved in that window never gets
+        // an offered log for it. Repair's later raw republish of an op on that log still arrives
+        // via the live push (unconditional, M4-14 stage 1), but with no predecessor known to the
+        // receiver it parks in the ingest out-of-order buffer forever (D3-j) instead of the
+        // orderer's own, visible pending state -- silently, since a buffered-with-no-predecessor
+        // op previously had no log line at all (see the new `ooo_park` probe below).
         tx!(&self.store, {
             self.store
                 .associate(&Topic::from(space_id), &self.id(), &member_log_id())
-                .await
+                .await?;
+
+            let y: AuthGroupState<AuthCapabilities> = self
+                .store
+                .get_groups_state_tx(Hash::digest(GLOBAL_GROUPS_CONTEXT_ID))
+                .await?
+                .unwrap_or_default();
+
+            for group_id in y.groups_global() {
+                debug!(
+                    group_id = group_id.fmt_short(),
+                    space_id = space_id.fmt_short(),
+                    "associate group log with space topic"
+                );
+                self.store
+                    .associate(&Topic::from(space_id), &self.id(), &group_log_id(group_id))
+                    .await?;
+            }
+
+            Ok::<_, SqliteError>(())
         })?;
 
         // Establish a topic pub/sub stream using the space id as a topic.
         let (tx, rx) = self
             .space_stream_from_inner(space_id, StreamFrom::Frontier)
             .await?;
+
+        // M4-14 round 2 (D3-r) test hook: if armed, pause right here -- the topic stream is open
+        // (so a peer can now dial in and its live session can resolve its offered log set) but
+        // nothing about this space has happened yet. Lets a test force a peer's session to resolve
+        // inside exactly this window instead of racing it with a sleep. A no-op unless a test has
+        // called `test_pause_next_create_space_after_stream_open` beforehand.
+        #[cfg(feature = "test-hooks")]
+        {
+            let notify = self
+                .test_create_space_pause_after_stream_open
+                .lock()
+                .expect("test hook mutex poisoned")
+                .take();
+            if let Some(notify) = notify {
+                notify.notified().await;
+            }
+        }
 
         // Issue the events to create a space.
         //
@@ -704,14 +776,13 @@ impl Node {
 
         drop(guard);
 
-        // D3-l (T2): mirror `space_from`'s restart-path association loop below -- if any sibling
-        // groups already existed globally at the moment this space was created (eg. control
-        // creating a space for a later drone after already creating earlier ones), our own log for
-        // each of those groups must be associated with this NEW space's topic too, exactly as it
-        // would be for a space we're resuming after a restart. Without this, a group Add/Remove op
-        // we later publish into one of those sibling groups' logs is never offered on this space's
-        // topic, and a `SpaceMembership` pointer that depends on it (`SpacesArgs::dependencies`)
-        // parks in a peer's orderer forever once repair.rs republishes it raw.
+        // D3-l (T2) / D3-r: catch up any group created between the pre-stream association above
+        // and this point (eg. a concurrent `create_group`/`create_space` on another topic's
+        // `consume` task, serialized by `control_lock` but not necessarily ordered before this
+        // read). The real fix for the "sibling group log unreachable to an early peer session" gap
+        // is the association loop above, run BEFORE the stream (and so before any peer's session
+        // can resolve) -- this loop is a harmless duplicate `associate()` call (idempotent) for the
+        // narrower window still open after that point.
         tx!(&self.store, {
             for group_id in groups_y.groups_global() {
                 self.store

@@ -164,7 +164,7 @@ where
             ProcessorStatus::Completed(OrdererResult::Pending)
         ) || matches!(
             self.ingest,
-            ProcessorStatus::Completed(IngestResult::OutOfOrder | IngestResult::Outdated)
+            ProcessorStatus::Completed(IngestResult::OutOfOrder { .. } | IngestResult::Outdated)
         )
     }
 

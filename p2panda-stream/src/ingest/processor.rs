@@ -5,6 +5,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::marker::PhantomData;
 
+use p2panda_core::traits::ShortFormat;
 use p2panda_core::{AnyOperation, Extensions, Hash, LogId, Operation, SeqNum, VerifyingKey};
 use p2panda_store::Transaction;
 use p2panda_store::logs::LogStore;
@@ -43,6 +44,10 @@ where
     pending_metadata: RefCell<HashMap<Hash, T::Metadata>>,
     notify: Notify,
     queue: RefCell<VecDeque<(T, IngestResult<E>)>>,
+    // M4-14 round 2 (D3-r): this node's own id, purely for the `ooo_park` debug probe below.
+    // `None` for every existing (test) caller of `new`, which never needed node identity; set via
+    // `with_node_id` by `p2panda`'s pipeline, the only caller that has one.
+    node_id: Option<VerifyingKey>,
     _marker: PhantomData<(L, TP)>,
 }
 
@@ -63,8 +68,17 @@ where
             pending_metadata: RefCell::new(HashMap::new()),
             notify: Notify::new(),
             queue: RefCell::new(VecDeque::new()),
+            node_id: None,
             _marker: PhantomData,
         }
+    }
+
+    /// Sets this node's own id, purely to tag the `ooo_park` debug probe (D3-r, M4-14 round 2).
+    /// Optional: an `Ingest` without a `node_id` still buffers/releases operations identically,
+    /// just without the tag on that one log line.
+    pub fn with_node_id(mut self, node_id: VerifyingKey) -> Self {
+        self.node_id = Some(node_id);
+        self
     }
 }
 
@@ -105,7 +119,7 @@ where
         };
 
         match result {
-            IngestResult::OutOfOrder => {
+            IngestResult::OutOfOrder { no_predecessor } => {
                 // Not inserted yet -- stash `input`'s own metadata (topic/source/spaces args/etc,
                 // whatever `T` carries) so we can rebuild a full `T` for it once `ooo` releases
                 // it below. The caller's pipeline is responsible for treating an `OutOfOrder`
@@ -113,12 +127,32 @@ where
                 // handled) -- this processor's own job is only correct buffering + eventual
                 // release, not suppressing downstream effects.
                 let hash = Borrow::<Operation<E>>::borrow(&input).hash;
+
+                // M4-14 round 2 (D3-r): `no_predecessor` means this (author, log_id) has no known
+                // frontier at all yet, and this isn't the log's own first operation -- this
+                // resting place previously had no log line anywhere, indistinguishable from an
+                // ordinary out-of-order buffering. Only the actual missing predecessor arriving
+                // (via live push, sync, or repair) releases it; a later in-order arrival elsewhere
+                // in the same log won't, since there's no chain to unlock.
+                if no_predecessor {
+                    let args: &IngestArgs<L, TP> = input.borrow();
+                    tracing::debug!(
+                        target: "p2panda::stream::ooo_park",
+                        node_id = ?self.node_id.map(|id| id.fmt_short()),
+                        op = %hash.fmt_short(),
+                        author = %Borrow::<Operation<E>>::borrow(&input).header.verifying_key.fmt_short(),
+                        log_id = ?args.log_id,
+                        seq_num = %Borrow::<Operation<E>>::borrow(&input).header.seq_num,
+                        "buffered with no known predecessor for its (author, log_id)"
+                    );
+                }
+
                 self.pending_metadata
                     .borrow_mut()
                     .insert(hash, input.metadata());
                 self.queue
                     .borrow_mut()
-                    .push_back((input, IngestResult::OutOfOrder));
+                    .push_back((input, IngestResult::OutOfOrder { no_predecessor }));
             }
             IngestResult::Ordered(ref operations) => {
                 // Every operation in `operations` (the just-arrived one, freeing zero or more
@@ -329,7 +363,14 @@ mod tests {
                 // operation_2 arrives out of order: buffered, no effect yet.
                 let (event, result) = stream.next().await.unwrap().unwrap();
                 assert_eq!(event.operation, operation_2);
-                assert_eq!(result, IngestResult::OutOfOrder);
+                // D3-r: operation_0 already established the frontier at seq_num=0, so this is an
+                // ordinary known-gap buffering, not "no predecessor known at all".
+                assert_eq!(
+                    result,
+                    IngestResult::OutOfOrder {
+                        no_predecessor: false
+                    }
+                );
 
                 // operation_1 arrives *directly in-order* (it is never itself buffered) and must
                 // still release the already-buffered operation_2 behind it -- this is exactly the

@@ -206,7 +206,8 @@ where
 
                     // Prepare event processing pipeline.
                     let ingest =
-                        Ingest::<SqliteStore, Event<L, E, TP>, L, E, TP>::new(store.clone());
+                        Ingest::<SqliteStore, Event<L, E, TP>, L, E, TP>::new(store.clone())
+                            .with_node_id(me);
                     let orderer = Orderer::<SqliteStore, Event<L, E, TP>, E>::new(store.clone());
                     let log_prune = LogPrune::<SqliteStore, Event<L, E, TP>, L>::new(store.clone());
                     let spaces = {
@@ -229,7 +230,7 @@ where
                                 // tracking), it just must cause nothing downstream.
                                 let suppress = matches!(
                                     result,
-                                    IngestResult::OutOfOrder | IngestResult::Outdated
+                                    IngestResult::OutOfOrder { .. } | IngestResult::Outdated
                                 );
                                 event.ingest = ProcessorStatus::Completed(result);
                                 if suppress { event.noop() } else { event }
