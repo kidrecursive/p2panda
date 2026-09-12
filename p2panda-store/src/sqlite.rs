@@ -10,7 +10,7 @@ use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::{Sqlite, migrate};
 use thiserror::Error;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
-use tracing::warn;
+use tracing::{error, warn};
 
 /// Creates the SQLite database if it doesn't already exist.
 pub async fn create_database(url: &str) -> Result<(), SqliteError> {
@@ -357,9 +357,18 @@ impl crate::traits::Transaction for SqliteStore {
                  holder (M4-12); this indicates a task was aborted while holding a store \
                  transaction"
             );
-            // Best-effort: if the rollback itself fails there's nothing more to do than drop the
-            // stale transaction and proceed -- the connection is already gone either way.
-            let _ = stale_tx.rollback().await;
+            // If the rollback itself fails (typically: the aborted holder's connection is already
+            // broken), SQLite discards the uncommitted transaction together with that connection,
+            // so no write from the cancelled holder can become visible either way -- but say so
+            // loudly instead of swallowing the error (trust-boundary review of M4-12): a failing
+            // rollback on a healthy connection would be a real store defect worth investigating.
+            if let Err(err) = stale_tx.rollback().await {
+                error!(
+                    %err,
+                    "SqliteStore::begin: rolling back the stale transaction failed; proceeding \
+                     with a fresh transaction (the stale one is discarded with its connection)"
+                );
+            }
         }
 
         let tx = self.pool.begin().await?;
