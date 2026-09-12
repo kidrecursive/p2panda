@@ -4,9 +4,10 @@ use std::hash::Hash as StdHash;
 use std::sync::Arc;
 
 use indexmap::IndexMap;
+use p2panda_core::traits::ShortFormat;
 use p2panda_core::{AnyHeader, Extensions, Hash, LogId, Operation, VerifyingKey};
 use tokio::sync::Mutex;
-use tracing::warn;
+use tracing::{debug, warn};
 
 #[derive(Debug)]
 pub enum OooResult<'a, E> {
@@ -258,7 +259,24 @@ where
     /// note): only that author's own buffered entries can ever be released by this operation.
     async fn pop_chain_after(&self, author: VerifyingKey, after: Hash, log_id: &L) -> Vec<Operation<E>> {
         let mut buffer = self.buffer.lock().await;
-        buffer.pop_from(author, Some(after), log_id.clone())
+        let freed = buffer.pop_from(author, Some(after), log_id.clone());
+        // M4-14 stage 2 probe: this is the "release" path for a chain whose predecessor arrived
+        // directly in-order (never itself buffered) -- distinct from the release that happens
+        // inline with a push in `push_and_pop_from` below. No node/actor id is threaded this deep
+        // into `p2panda-stream`; `author` (verifying_key) plus the released op hashes are the
+        // correlators against the node_id-tagged stage 1 probes further up the pipeline.
+        if !freed.is_empty() {
+            debug!(
+                target: "p2panda::stream::ooo",
+                author = %author.fmt_short(),
+                log_id = ?log_id,
+                after = %after.fmt_short(),
+                released = freed.len(),
+                released_ops = ?freed.iter().map(|op| op.hash.fmt_short()).collect::<Vec<_>>(),
+                "ooo buffer release (direct in-order arrival freed a waiting chain)"
+            );
+        }
+        freed
     }
 
     async fn push_and_pop_from<'a>(
@@ -269,6 +287,22 @@ where
     ) -> OooResult<'a, E> {
         let mut buffer = self.buffer.lock().await;
         let author = operation.header.verifying_key;
+
+        // M4-14 stage 2 probe: buffer push. `author` + `log_id` + `backlink` are the ChainRing's
+        // own key (see the security note on `OooBuffer` above); `op` hash is the join key against
+        // the node_id-tagged stage 1 probes upstream (ingest result in `p2panda/src/streams/
+        // stream.rs`) and the wire-receive probes in `p2panda-sync` -- no node/actor id is
+        // threaded this deep into the ingest pipeline (`Ingest` in
+        // `p2panda-stream/src/ingest/processor.rs` doesn't carry one either).
+        debug!(
+            target: "p2panda::stream::ooo",
+            op = %operation.hash.fmt_short(),
+            author = %author.fmt_short(),
+            log_id = ?log_id,
+            seq = operation.header.seq_num,
+            backlink = ?operation.header.backlink.map(|h| h.fmt_short()),
+            "ooo buffer push"
+        );
 
         // Push item to ring-buffer, this will eventually evict old items when full.
         buffer.push(
@@ -294,8 +328,20 @@ where
         // ```
         let result = buffer.pop_from(author, expected_backlink, log_id.clone());
         if result.is_empty() {
+            debug!(
+                target: "p2panda::stream::ooo",
+                op = %operation.hash.fmt_short(),
+                "ooo buffer: no release (still out of order)"
+            );
             OooResult::OutOfOrder
         } else {
+            debug!(
+                target: "p2panda::stream::ooo",
+                op = %operation.hash.fmt_short(),
+                released = result.len(),
+                released_ops = ?result.iter().map(|op| op.hash.fmt_short()).collect::<Vec<_>>(),
+                "ooo buffer release"
+            );
             OooResult::Ordered(result)
         }
     }

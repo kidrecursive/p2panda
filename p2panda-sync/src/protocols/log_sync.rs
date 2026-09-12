@@ -314,6 +314,24 @@ where
 
                                         // Insert message hash into deduplication buffer.
                                         if !dedup.insert(header.hash()) {
+                                            // M4-14 stage 2 probe: `debug!` (not `trace!`) so this
+                                            // shows up under `RUST_LOG=debug` captures. `log_id` is
+                                            // not resolvable here -- this generic protocol layer
+                                            // never learns which `L` a received operation belongs to
+                                            // (that mapping is app-specific and only happens later,
+                                            // at ingest -- see the node_id-tagged probe on the
+                                            // `IngestResult` in `p2panda/src/streams/stream.rs`,
+                                            // stage 1, which is joinable to this line by `op` hash).
+                                            debug!(
+                                                target: "p2panda::sync::wire_rx",
+                                                parent: &span,
+                                                phase = "catch_up",
+                                                op = %header.hash().fmt_short(),
+                                                author = %header.verifying_key.fmt_short(),
+                                                seq = header.seq_num,
+                                                outcome = "dropped_dup",
+                                                "receiver: operation arrived on wire"
+                                            );
                                             trace!(
                                                 parent: &span,
                                                 operation_id = %header.hash().fmt_short(),
@@ -322,6 +340,22 @@ where
 
                                             continue;
                                         }
+
+                                        // M4-14 stage 2 probe: `debug!` companion to the `trace!`
+                                        // below, tagged `phase = "catch_up"` so it can be
+                                        // distinguished from the live-mode receive probe in
+                                        // `topic_log_sync.rs`, and correlated across nodes by `op`
+                                        // hash against stage 1's ingest-result probe.
+                                        debug!(
+                                            target: "p2panda::sync::wire_rx",
+                                            parent: &span,
+                                            phase = "catch_up",
+                                            op = %header.hash().fmt_short(),
+                                            author = %header.verifying_key.fmt_short(),
+                                            seq = header.seq_num,
+                                            received_ops = metrics.received_operations,
+                                            "receiver: operation arrived on wire"
+                                        );
 
                                         trace!(
                                             parent: &span,

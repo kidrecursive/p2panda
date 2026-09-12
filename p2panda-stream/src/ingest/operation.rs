@@ -2,6 +2,7 @@
 
 //! Methods to handle p2panda operations.
 use p2panda_core::prune::validate_prunable_backlink;
+use p2panda_core::traits::ShortFormat;
 use p2panda_core::{
     AnyHeader, AnyOperation, Extensions, Hash, LogId, Operation, SeqNum, VerifyingKey,
 };
@@ -10,6 +11,7 @@ use p2panda_store::logs::LogStore;
 use p2panda_store::operations::OperationStore;
 use p2panda_store::topics::TopicStore;
 use thiserror::Error;
+use tracing::debug;
 
 use crate::ingest::ooo::{OooBuffer, OooResult};
 
@@ -86,6 +88,19 @@ where
         .map_err(|err| IngestError::StoreError(err.to_string()))?;
 
     if already_exists {
+        // M4-14 stage 2 probe: `has_operation_tx` dedup hit. No node/actor id is threaded this
+        // deep into `p2panda-stream::ingest` (`Ingest` in `ingest/processor.rs` doesn't carry
+        // one either) -- `op` hash is the join key against the node_id-tagged stage 1 probe on
+        // the `IngestResult` in `p2panda/src/streams/stream.rs` (which logs `AlreadyExists` for
+        // this same op right after this function returns) and against the wire-receive probes
+        // in `p2panda-sync`.
+        debug!(
+            target: "p2panda::stream::ingest",
+            op = %operation.hash.fmt_short(),
+            author = %operation.header.verifying_key.fmt_short(),
+            seq = operation.header.seq_num,
+            "ingest: has_operation_tx dedup hit"
+        );
         return Ok(IngestResult::AlreadyExists);
     }
 

@@ -208,7 +208,22 @@ where
                         Some(message) = live_mode_rx.next() => {
                             match message {
                                 ToSync::Payload(operation) => {
+                                    // M4-14 stage 2 probe: this arm is where a session handles the
+                                    // effect of an application-level `sync_handle.publish()` (see
+                                    // stage 1's "live push attempt" probe in
+                                    // `p2panda/src/streams/stream.rs`) -- one copy of every publish
+                                    // is broadcast to every session currently in live mode, so this
+                                    // per-session `debug!` is what tells us whether *this* session's
+                                    // copy was actually written to the wire, or dropped here as a
+                                    // dup of something this same session already forwarded.
                                     if !dedup.insert(operation.hash) {
+                                        debug!(
+                                            target: "p2panda::sync::wire_tx",
+                                            phase = "live",
+                                            op = %operation.hash.fmt_short(),
+                                            outcome = "dropped_dup",
+                                            "sender: publish handled for session"
+                                        );
                                         trace!(
                                             id = %operation.hash.fmt_short(),
                                             "ignore duplicate operation sent on live-mode channel"
@@ -235,6 +250,14 @@ where
                                         )))
                                         .await
                                         .map_err(|err| TopicLogSyncChannelError::MessageSink(format!("{err:?}")).into());
+
+                                    debug!(
+                                        target: "p2panda::sync::wire_tx",
+                                        phase = "live",
+                                        op = %operation.hash.fmt_short(),
+                                        outcome = if result.is_ok() { "written" } else { "send_error" },
+                                        "sender: publish handled for session"
+                                    );
 
                                     if result.is_err() {
                                         break result;
@@ -288,6 +311,20 @@ where
                                     // previously present do not forward the operation to the application
                                     // layer.
                                     if !dedup.insert(header.hash()) {
+                                        // M4-14 stage 2 probe: `log_id` is not resolvable at this
+                                        // generic protocol layer for a just-received operation (see
+                                        // the matching note in `log_sync.rs`'s catch-up probe);
+                                        // `op` hash is the join key against stage 1's node_id-tagged
+                                        // ingest-result probe.
+                                        debug!(
+                                            target: "p2panda::sync::wire_rx",
+                                            phase = "live",
+                                            op = %header.hash().fmt_short(),
+                                            author = %header.verifying_key.fmt_short(),
+                                            seq = header.seq_num,
+                                            outcome = "dropped_dup",
+                                            "receiver: operation arrived on wire"
+                                        );
                                         trace!(
                                             phase = "live",
                                             operation_id = %header.hash().fmt_short(),
@@ -299,6 +336,16 @@ where
 
                                     metrics.received_live_bytes += header.size() + header.payload_size;
                                     metrics.received_live_operations += 1;
+
+                                    debug!(
+                                        target: "p2panda::sync::wire_rx",
+                                        phase = "live",
+                                        op = %header.hash().fmt_short(),
+                                        author = %header.verifying_key.fmt_short(),
+                                        seq = header.seq_num,
+                                        received_ops = metrics.received_live_operations,
+                                        "receiver: operation arrived on wire"
+                                    );
 
                                     trace!(
                                         phase = "live",
