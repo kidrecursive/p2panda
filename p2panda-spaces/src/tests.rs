@@ -1630,6 +1630,138 @@ async fn repair_space() {
     assert_eq!(members, expected_members);
 }
 
+/// D3-l regression test: `Space::repair` must only ever forge pointers for auth operations
+/// present in the exact groups-state snapshot the caller passed in, never for operations added to
+/// the global state afterwards.
+///
+/// Before this fix `Space::repair` re-read the global groups state fresh on every call (instead of
+/// taking it as a parameter). `p2panda::spaces::repair::repair_space` builds its raw-op republish
+/// list from an earlier snapshot, then hands off to `Manager::repair_space` -> `Space::repair`. If
+/// a concurrent auth op landed in the global state in between those two reads, the fresh re-read
+/// would forge a pointer for that op even though it was never included in the raw republish list
+/// -- producing a `SpaceMembership` pointer whose `auth_message_id` dependency is never satisfied
+/// on the receiving end, parking it (and everything causally after it) in the orderer forever.
+///
+/// This test proves the parameterized `Space::repair` can no longer do that: given a stale
+/// snapshot taken before a concurrent group op is processed, repairing against that stale snapshot
+/// must never reference the concurrent op, no matter what the manager's live global state has
+/// moved on to.
+#[tokio::test]
+async fn repair_forges_pointers_only_from_the_given_snapshot() {
+    let alice = TestPeer::new(0).await;
+    let bob = <TestPeer>::new(1).await;
+    let claire = <TestPeer>::new(2).await;
+
+    let bob_id = bob.manager.id();
+    let claire_id = claire.manager.id();
+
+    let alice_manager = alice.manager.clone();
+    let bob_manager = bob.manager.clone();
+    let claire_manager = claire.manager.clone();
+
+    alice_manager
+        .register_member(&bob_manager.me().await.unwrap())
+        .await
+        .unwrap();
+    alice_manager
+        .register_member(&claire_manager.me().await.unwrap())
+        .await
+        .unwrap();
+    bob_manager
+        .register_member(&alice_manager.me().await.unwrap())
+        .await
+        .unwrap();
+    bob_manager
+        .register_member(&claire_manager.me().await.unwrap())
+        .await
+        .unwrap();
+
+    // Alice: Create Group with Bob as a manager, then a Space with that group as a read member.
+    let (group, message_01, _) = alice_manager
+        .create_group_persisted(&[(bob_id, Access::manage())])
+        .await
+        .unwrap();
+    let member_group_id = group.id();
+
+    let space_id = SpaceId::digest(b"0");
+    let (space, _messages, _) = alice_manager
+        .create_space_persisted(space_id, &[(member_group_id, Access::read())])
+        .await
+        .unwrap();
+    drop(space);
+
+    // Bob learns about the group (but not the space yet) and concurrently adds Claire to it.
+    bob.persist_operation(&message_01).await.unwrap();
+    bob_manager.process_persisted(&message_01).await.unwrap();
+    let group = bob_manager.group(member_group_id).await.unwrap().unwrap();
+    let bob_message_01 = group
+        .add_persisted(claire_id, Access::read())
+        .await
+        .unwrap();
+    drop(group);
+
+    // Take a snapshot of the global groups state BEFORE alice learns about Bob's concurrent add --
+    // this simulates the earlier read in `p2panda::spaces::repair::repair_space` that the raw-op
+    // republish list would be built from.
+    let stale_snapshot = alice_manager.get_groups_state().await.unwrap();
+    assert!(
+        !stale_snapshot
+            .inner
+            .operations
+            .contains_key(&bob_message_01.hash()),
+        "sanity: bob's concurrent add must not be in the stale snapshot yet"
+    );
+
+    // Now alice processes Bob's concurrent add, advancing her live global state past the snapshot.
+    alice.persist_operation(&bob_message_01).await.unwrap();
+    alice_manager
+        .process_persisted(&bob_message_01)
+        .await
+        .unwrap();
+
+    let live_snapshot = alice_manager.get_groups_state().await.unwrap();
+    assert!(
+        live_snapshot
+            .inner
+            .operations
+            .contains_key(&bob_message_01.hash()),
+        "sanity: alice's live global state has moved past the stale snapshot"
+    );
+
+    // Repair the space against the STALE snapshot, as `repair_space` now does with the snapshot it
+    // read before building its raw-op list -- the important thing is that this call sees the
+    // caller-supplied snapshot and NOT `alice_manager`'s live global state.
+    let space = alice_manager.space(space_id).await.unwrap().unwrap();
+    let (_space_y, messages, _events) = space
+        .repair(&stale_snapshot, &[member_group_id])
+        .await
+        .unwrap();
+
+    for message in &messages {
+        if let SpacesArgs::SpaceMembership {
+            auth_message_id, ..
+        } = message.borrow()
+        {
+            assert!(
+                stale_snapshot
+                    .inner
+                    .operations
+                    .contains_key(auth_message_id),
+                "repair forged a pointer for auth op {:?} which is not in the snapshot it was \
+                 given -- this is exactly the T1 defect (a pointer with no matching raw op, which \
+                 parks in the orderer forever)",
+                auth_message_id
+            );
+            assert_ne!(
+                *auth_message_id,
+                bob_message_01.hash(),
+                "repair must not forge a pointer for Bob's concurrent add when repairing against \
+                 the stale snapshot taken before that op was known"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn duplicate_auth_state_references() {
     let alice = TestPeer::new(0).await;

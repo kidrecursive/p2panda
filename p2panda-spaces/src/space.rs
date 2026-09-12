@@ -642,11 +642,22 @@ where
         Ok(Some((y, events)))
     }
 
+    /// Repair this space against a caller-supplied snapshot of the global groups state.
+    ///
+    /// D3-l: this used to re-read the global groups state fresh here, but the raw-op republish
+    /// list built by `p2panda::spaces::repair::repair_space` is derived from an *earlier* snapshot
+    /// (taken before the per-space repair loop runs). If a concurrent auth op landed in the global
+    /// state between those two reads, this method would forge a `SpaceMembership` pointer for it
+    /// without the matching raw op ever having been republished into the space topic -- the
+    /// pointer's `auth_message_id` then never arrives, and every later pointer in the chain parks
+    /// in the orderer forever (see `p2panda_spaces::message::SpacesArgs::dependencies`). Taking
+    /// the snapshot as a parameter guarantees the pointers forged here are drawn from exactly the
+    /// same view of the world as the raw-op list the caller already computed.
     pub async fn repair(
         &self,
+        groups_y: &AuthGroupState<C>,
         groups: &[GroupId],
     ) -> Result<(SpacesState<C>, Vec<F::Message>, Vec<Event<C>>), SpaceError<F, C>> {
-        let groups_y = self.manager.get_groups_state().await?;
         let mut space_y = self.state().await?;
 
         let mut messages = vec![];
@@ -1010,7 +1021,11 @@ where
         &self,
         groups: &[GroupId],
     ) -> Result<(Vec<F::Message>, Vec<Event<C>>), SpaceError<F, C>> {
-        let (space_y, messages, events) = self.repair(groups).await?;
+        // Single-space convenience wrapper (used directly by tests, outside the batched
+        // `Manager::repair_spaces` path) -- reads its own snapshot since there is no sibling
+        // repair in the same batch to stay consistent with.
+        let groups_y = self.manager.get_groups_state().await?;
+        let (space_y, messages, events) = self.repair(&groups_y, groups).await?;
         self.manager
             .set_space_state(&self.id(), &space_y.into())
             .await?;

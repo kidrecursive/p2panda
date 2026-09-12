@@ -473,9 +473,15 @@ where
     /// A sensible approach to detecting and repairing spaces will involve processing messages in
     /// logical batches and only detecting and repairing any out-of-sync spaces after a batch has
     /// been processed. Alternatively some scheduling or throttling logic could be employed.
+    /// D3-l: takes the groups state snapshot as a parameter (rather than reading it fresh) so
+    /// that callers repairing multiple spaces from one batch (`repair_spaces`) -- or a caller like
+    /// `p2panda::spaces::repair::repair_space` that already computed a raw-op republish list from
+    /// its own snapshot -- forge pointers from the exact same view of the world as that list. See
+    /// `Space::repair` for the full rationale.
     pub async fn repair_space(
         &self,
         space_id: SpaceId,
+        groups_y: &AuthGroupState<C>,
         groups: &[GroupId],
     ) -> Result<(SpacesState<C>, Vec<F::Message>, Vec<Event<C>>), ManagerError<F, C>> {
         let Some(space) = self.space(space_id).await? else {
@@ -493,7 +499,10 @@ where
             return Ok((space_y, vec![], vec![]));
         }
 
-        let result = space.repair(groups).await.map_err(ManagerError::Space)?;
+        let result = space
+            .repair(groups_y, groups)
+            .await
+            .map_err(ManagerError::Space)?;
 
         Ok(result)
     }
@@ -675,11 +684,16 @@ where
         Ok(events)
     }
 
+    /// D3-l: loads ONE groups state snapshot and repairs every space against it, instead of each
+    /// space re-reading the (possibly-changed-by-then) global state independently. See
+    /// `Space::repair` for the rationale.
     pub async fn repair_spaces(
         &self,
         space_ids: &[SpaceId],
     ) -> Result<Vec<(SpacesState<C>, Vec<F::Message>, Vec<Event<C>>)>, ManagerError<F, C>> {
         let mut results = vec![];
+
+        let groups_y = self.get_groups_state().await?;
 
         for id in space_ids {
             let Some(space) = self.space(*id).await? else {
@@ -699,7 +713,7 @@ where
             }
 
             let result = space
-                .repair(&[space.group_id().await?])
+                .repair(&groups_y, &[space.group_id().await?])
                 .await
                 .map_err(ManagerError::Space)?;
             results.push(result);

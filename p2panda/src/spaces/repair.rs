@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::borrow::Borrow;
+use std::collections::HashSet;
 use std::time::Duration;
 
 use p2panda_core::traits::{Provenance, ShortFormat};
@@ -169,6 +170,12 @@ pub(crate) async fn repair_space<M>(
 
     store.commit(permit).await?;
 
+    // D3-l: the set of auth ops already known to the space *before* this repair, used below to
+    // check the invariant this fix restores (every forged pointer's `auth_message_id` must be
+    // either in this batch's raw republish set or already known to the space -- never neither).
+    let already_known_to_space: HashSet<Hash> =
+        space_y.groups_y.inner.operations.keys().copied().collect();
+
     // Attempt to repair the space. As we pass in an array containing a single space id there will
     // be only ever max one result returned.
     //
@@ -177,7 +184,40 @@ pub(crate) async fn repair_space<M>(
     // @TODO: This method uses transactions internally (eg. in the Forge) and so we can't make
     // everything part of one transaction on this level yet. It isn't a source of bugs though so
     // for now this is ok.
-    let (space_y, spaces_messages, events) = manager.repair_space(space_id, &group_ids).await?;
+    let (space_y, spaces_messages, events) = manager
+        .repair_space(space_id, &groups_y, &group_ids)
+        .await?;
+
+    // D3-l: enforce the invariant that repairing a space never forges a `SpaceMembership` pointer
+    // for an auth op that isn't reachable in this batch's raw republish set or already applied to
+    // the space -- violating it is exactly what parks that pointer (and everything causally after
+    // it) in the orderer forever, since a pointer's dependencies always include its
+    // `auth_message_id` (see `SpacesArgs::dependencies`).
+    let raw_ids: HashSet<Hash> = groups_operations.iter().map(|op| op.hash).collect();
+    for message in &spaces_messages {
+        if let SpacesArgs::SpaceMembership {
+            auth_message_id, ..
+        } = message.borrow()
+        {
+            let known = raw_ids.contains(auth_message_id)
+                || already_known_to_space.contains(auth_message_id);
+            debug_assert!(
+                known,
+                "repair forged a pointer for auth op {} which is neither in this batch's raws \
+                 nor already known to the space -- this pointer will park forever",
+                auth_message_id.fmt_short()
+            );
+            if !known {
+                warn!(
+                    node_id = manager.id().fmt_short(),
+                    space_id = space_id.fmt_short(),
+                    auth_message_id = %auth_message_id.fmt_short(),
+                    "repair forged a pointer for an auth op missing from this batch's raws and \
+                     from the space's known state; it will never become ready"
+                );
+            }
+        }
+    }
 
     // If no space messages were forged during repairing then no state change occurred and we
     // don't need to persist here. This occurs when we are not a _read_ member of the space (yet).
