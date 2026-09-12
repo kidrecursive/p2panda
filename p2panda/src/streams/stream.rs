@@ -101,6 +101,10 @@ const IMPORT_BUFFER_SIZE: usize = 16;
 /// ```
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn processed_stream<M>(
+    // M4-14 stage 1 probe: this node's own id, threaded through purely so the live-push and
+    // ingest-result debug probes below can be correlated across nodes in a multi-node capture
+    // (`node_id`-tagged lines, matching the D3-l/D3-q probe convention). No behaviour change.
+    node_id: VerifyingKey,
     topic: Topic,
     ack_policy: AckPolicy,
     sync_handle: SyncHandle<Operation, TopicLogSyncEvent<Extensions>>,
@@ -255,6 +259,7 @@ where
                 // This will block processing of the sync stream and of locally created operations
                 // until it is complete.
                 let replay_result = replay_log_ranges(
+                    node_id,
                     topic,
                     &store,
                     &to_output_tx,
@@ -313,7 +318,7 @@ where
                             sync_metrics::SyncEvent::SyncStarted { .. } => vec![event.into()],
                             sync_metrics::SyncEvent::SyncEnded { .. } => vec![event.into()],
                             sync_metrics::SyncEvent::OperationReceived { operation, source } => {
-                                process_operation_in(*operation, source, topic, &pipeline, &sync_handle).await;
+                                process_operation_in(node_id, *operation, source, topic, &pipeline, &sync_handle).await;
                                 continue;
                             },
                         }
@@ -329,6 +334,7 @@ where
                     // through import (even ones published locally).
                     Some((operation, _message, processed_tx)) = publish_rx.recv() => {
                         let event = process_operation_in(
+                            node_id,
                             operation,
                             Source::LocalStore,
                             topic,
@@ -361,6 +367,7 @@ where
                             } => vec![StreamEvent::ImportStarted { session_id }.into()],
                             ExternalStreamEvent::Operation { session_id, operation } => {
                                 process_operation_in(
+                                    node_id,
                                     *operation,
                                     Source::ExternalStream { session_id },
                                     topic,
@@ -392,6 +399,7 @@ where
                         match event {
                             LocalStreamEvent::Operation(operation) => {
                                 process_operation_in(
+                                    node_id,
                                     *operation,
                                     Source::LocalStore,
                                     topic,
@@ -436,6 +444,8 @@ where
 
 /// Process an incoming operation in the pipeline.
 pub(crate) async fn process_operation_in(
+    // M4-14 stage 1 probe.
+    node_id: VerifyingKey,
     operation: Operation,
     source: Source,
     topic: Topic,
@@ -448,6 +458,12 @@ pub(crate) async fn process_operation_in(
 
     // TODO: Using the Source here to determine live-mode behaviour is not explicit enough and might
     // lead to errors.
+    //
+    // M4-14 stage 1 probe: this push is attempted unconditionally for `ExternalStream`/`LocalStore`
+    // sources -- before the ingest result below is even known -- so its outcome cannot itself be
+    // gated on `Inserted` vs `AlreadyExists`. The `debug!` below makes the attempt (and whether
+    // `publish` itself reported ok/err) observable, to be correlated by `op` hash against the ingest
+    // result logged further down.
     match source {
         Source::ExternalStream { .. } | Source::LocalStore
             // Try pushing operation to other nodes if we have an active and "live" sync session
@@ -455,7 +471,19 @@ pub(crate) async fn process_operation_in(
             //
             // If no active live session exists, nodes will pick up the operation later when running
             // the sync protocol.
-            if sync_handle.publish(operation.clone()).is_err() => {
+            if {
+                let result = sync_handle.publish(operation.clone());
+                debug!(
+                    target: "p2panda::stream::live_push",
+                    node_id = %node_id.fmt_short(),
+                    topic = %topic.to_hex(),
+                    op = %p2panda_core::traits::ShortFormat::fmt_short(&operation.hash()),
+                    source = ?source,
+                    ok = result.is_ok(),
+                    "live push attempt"
+                );
+                result.is_err()
+            } => {
                 warn!(
                     operation_id = %operation.hash(),
                     "failed sending operation on sync handle"
@@ -476,6 +504,17 @@ pub(crate) async fn process_operation_in(
             spaces_args,
         ))
         .await;
+
+    // M4-14 stage 1 probe: the ingest result (`Inserted`/`AlreadyExists`/`OutOfOrder`/`Outdated`)
+    // for this same `op`, correlatable against the "live push attempt" line above by `op` hash.
+    debug!(
+        target: "p2panda::stream::live_push",
+        node_id = %node_id.fmt_short(),
+        topic = %topic.to_hex(),
+        op = %p2panda_core::traits::ShortFormat::fmt_short(&event.operation.hash),
+        ingest = ?event.ingest,
+        "process operation ingest result"
+    );
 
     // The actual output from the pipeline comes via a channel to the topic stream, see
     // process_operation_out. The returned event here is only for (optional) inspection for users

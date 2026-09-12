@@ -48,6 +48,8 @@ impl From<Cursor<VerifyingKey, LogId>> for StreamFrom {
 
 /// Re-play and re-process locally stored operations.
 pub(crate) async fn replay_log_ranges<M>(
+    // M4-14 stage 1 probe.
+    node_id: VerifyingKey,
     topic: Topic,
     store: &SqliteStore,
     to_output_tx: &mpsc::Sender<Vec<ForwardEvent<M>>>,
@@ -78,6 +80,7 @@ where
         } = result?;
 
         process_operation_in(
+            node_id,
             operation
                 .try_into()
                 .expect("values from the database are valid"),

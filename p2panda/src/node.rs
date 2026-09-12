@@ -385,6 +385,7 @@ impl Node {
         );
 
         let (tx, rx) = processed_stream(
+            self.spaces_manager.id(),
             topic,
             self.config.ack_policy,
             sync_handle,
