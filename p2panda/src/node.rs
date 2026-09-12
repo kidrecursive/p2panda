@@ -669,6 +669,23 @@ impl Node {
                 .await?;
         });
 
+        // D3-l (T2): mirror `space_from`'s restart-path association loop below -- if any sibling
+        // groups already existed globally at the moment this space was created (eg. control
+        // creating a space for a later drone after already creating earlier ones), our own log for
+        // each of those groups must be associated with this NEW space's topic too, exactly as it
+        // would be for a space we're resuming after a restart. Without this, a group Add/Remove op
+        // we later publish into one of those sibling groups' logs is never offered on this space's
+        // topic, and a `SpaceMembership` pointer that depends on it (`SpacesArgs::dependencies`)
+        // parks in a peer's orderer forever once repair.rs republishes it raw.
+        tx!(&self.store, {
+            for group_id in groups_y.groups_global() {
+                self.store
+                    .associate(&Topic::from(space_id), &self.id(), &group_log_id(group_id))
+                    .await?;
+            }
+            Ok::<_, SqliteError>(())
+        })?;
+
         let processed = tx
             .import_local(futures_util::stream::iter(
                 create_space_messages

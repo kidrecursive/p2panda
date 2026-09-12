@@ -144,26 +144,28 @@ pub(crate) async fn repair_space<M>(
         };
 
         // Ignore non-groups operations.
-        let Some(SpacesArgs::Group {
-            group_id,
-            group_action,
-            ..
-        }) = operation.header.extensions.spaces_args()
+        let Some(SpacesArgs::Group { group_id, .. }) = operation.header.extensions.spaces_args()
         else {
             warn!("expected auth groups operation");
             continue;
         };
 
-        // If this is a create operation then associate the groups log with this space topic.
-        if group_action.is_create() {
-            store
-                .associate(
-                    &Topic::from(space_id),
-                    &operation.author(),
-                    &group_log_id(group_id),
-                )
-                .await?;
-        }
+        // D3-l (T2): associate EVERY republished group op's log with this space topic, not only
+        // Create ops. Every author maintains their own log of control messages per group (see
+        // `p2panda::spaces::forge::make_space_group_log_associations`'s comment) -- if group X was
+        // created by Alice but Bob later published an Add/Remove/Promote/Demote into group X from
+        // his own log, that log was never associated with this space's topic under the
+        // Create-only guard this replaces. Any later pointer forged for Bob's op then depends
+        // (via `SpacesArgs::dependencies`) on an auth op whose log a late-joining member can never
+        // pull via topic-scoped log sync, parking that pointer -- and everything causally after it
+        // -- in the orderer forever.
+        store
+            .associate(
+                &Topic::from(space_id),
+                &operation.author(),
+                &group_log_id(group_id),
+            )
+            .await?;
 
         groups_operations.push(operation)
     }
