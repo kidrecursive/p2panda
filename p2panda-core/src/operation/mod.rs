@@ -57,7 +57,8 @@
 //! let body = Body::from_bytes("Prune from here please!".as_bytes());
 //! let header = Header::builder()
 //!     .body(&body)
-//!     .build(&signing_key, extensions);
+//!     .build(&signing_key, extensions)
+//!     .unwrap();
 //!
 //! assert!(header.extensions.prune_flag.is_set())
 //! ```
@@ -79,3 +80,18 @@ pub use errors::{HeaderError, OperationError};
 pub use header::{Header, PayloadSize, Version};
 pub use operation::{Operation, RawOperation};
 pub use validation::{validate_backlink, validate_header, validate_operation};
+
+/// Maximum size, in bytes, of any single CBOR item inside an encoded header (including the
+/// `extensions` byte string).
+///
+/// This bounds how much memory a peer can be forced to allocate for a single header field while
+/// decoding data received from the network (`AnyHeader::decode`, `p2panda-core/src/operation/any.rs`)
+/// -- untrusted peers cannot force allocations beyond this per header. It also bounds what we as
+/// the encoder are willing to sign and store: [`Builder::build`] rejects headers whose encoded
+/// size would exceed it (`HeaderError::TooLarge`), so we never write an operation to our own log
+/// that we could never decode again.
+///
+/// Raised from 512 B to 64 KiB (D3-o, `docs/upstream/p2panda-header-length-limit.md`): p2panda-spaces
+/// carries application ciphertext in the header's `extensions` field (`p2panda/src/spaces/forge.rs`),
+/// so the header grows with the payload size; 512 B only fit payloads up to roughly 64 B.
+pub const MAX_HEADER_ITEM_LEN: usize = 64 * 1024;

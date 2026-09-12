@@ -8,8 +8,9 @@ use crate::hash::Hash;
 use crate::identity::Signer;
 use crate::logs::SeqNum;
 use crate::operation::header::encode_header;
-use crate::operation::{Header, PayloadSize};
+use crate::operation::{Header, MAX_HEADER_ITEM_LEN, PayloadSize};
 use crate::traits::Extensions;
+use crate::HeaderError;
 
 /// Build & sign operations.
 pub struct Builder<E> {
@@ -89,7 +90,12 @@ where
     ///
     /// A custom header extensions type can be set here as well when required. It will be embedded
     /// in the header. Set this to `()` (unit-type) when extensions are not necessary.
-    pub fn build<S: Signer>(self, signing_key: &S, extensions: E) -> Header<E> {
+    ///
+    /// Returns [`HeaderError::TooLarge`] if the encoded header, or its `extensions` CBOR item,
+    /// would exceed [`MAX_HEADER_ITEM_LEN`] -- the same bound `AnyHeader::decode` enforces on
+    /// read (D3-o). We reject here, before signing and storing, rather than sign an operation we
+    /// (or any peer) could never decode again.
+    pub fn build<S: Signer>(self, signing_key: &S, extensions: E) -> Result<Header<E>, HeaderError> {
         let version = 1;
 
         let verifying_key = signing_key.verifying_key();
@@ -100,6 +106,16 @@ where
         } else {
             None
         };
+
+        if let Some(ref extensions_cbor) = extensions_cbor {
+            let extensions_len = extensions_cbor.encode().len();
+            if extensions_len > MAX_HEADER_ITEM_LEN {
+                return Err(HeaderError::TooLarge {
+                    len: extensions_len,
+                    max: MAX_HEADER_ITEM_LEN,
+                });
+            }
+        }
 
         let signing_bytes = encode_header(
             version,
@@ -125,10 +141,17 @@ where
             extensions_cbor.as_ref(),
         );
 
+        if bytes.len() > MAX_HEADER_ITEM_LEN {
+            return Err(HeaderError::TooLarge {
+                len: bytes.len(),
+                max: MAX_HEADER_ITEM_LEN,
+            });
+        }
+
         let digest = Hash::digest(&bytes);
         let size = bytes.len() as u32;
 
-        Header {
+        Ok(Header {
             version,
             verifying_key,
             signature,
@@ -140,6 +163,6 @@ where
             extensions_cbor,
             digest,
             size,
-        }
+        })
     }
 }

@@ -86,7 +86,7 @@ impl Forge<Topic, LogId, Extensions> for OperationForge {
                     builder = builder.body(body);
                 }
 
-                builder.build(&self.credentials, extensions)
+                builder.build(&self.credentials, extensions)?
             };
 
             if let Some(topic) = topic {
@@ -124,6 +124,9 @@ impl Forge<Topic, LogId, Extensions> for OperationForge {
 pub enum ForgeError {
     #[error(transparent)]
     Sqlite(#[from] SqliteError),
+
+    #[error(transparent)]
+    Header(#[from] p2panda_core::HeaderError),
 }
 
 #[cfg(test)]

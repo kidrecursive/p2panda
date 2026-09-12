@@ -326,12 +326,15 @@ mod tests {
             let signing_key = SigningKey::generate();
             let body: Body = b"Hi, Icebear".to_vec().into();
 
-            let header = Header::builder().body(&body).build(
-                &signing_key,
-                TestExtension {
-                    dependencies: vec![],
-                },
-            );
+            let header = Header::builder()
+                .body(&body)
+                .build(
+                    &signing_key,
+                    TestExtension {
+                        dependencies: vec![],
+                    },
+                )
+                .unwrap();
 
             Operation::from_parts(header, Some(body))
         };
@@ -342,12 +345,15 @@ mod tests {
             let signing_key = SigningKey::generate();
             let body: Body = b"Hello, Pandasan!".to_vec().into();
 
-            let header = Header::builder().body(&body).build(
-                &signing_key,
-                TestExtension {
-                    dependencies: vec![operation_panda.hash],
-                },
-            );
+            let header = Header::builder()
+                .body(&body)
+                .build(
+                    &signing_key,
+                    TestExtension {
+                        dependencies: vec![operation_panda.hash],
+                    },
+                )
+                .unwrap();
 
             Operation::from_parts(header, Some(body))
         };

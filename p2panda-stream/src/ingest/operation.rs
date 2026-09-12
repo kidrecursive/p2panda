@@ -380,7 +380,8 @@ mod tests {
         let header = Header::builder()
             // we'll be missing 11 operations between the first and this one
             .chain(12, Hash::digest(b"mock operation"))
-            .build(&signing_key, ());
+            .build(&signing_key, ())
+            .unwrap();
 
         let operation = Operation::from_parts(header, None);
         let result = ingest_operation(&store, None, &operation, &1, &1, false).await;
@@ -397,7 +398,8 @@ mod tests {
         //    been pruned.
         let header = Header::builder()
             .chain(1, Hash::digest(b"mock operation"))
-            .build(&signing_key, ());
+            .build(&signing_key, ())
+            .unwrap();
         let operation = Operation::from_parts(header, None);
 
         let prune_flag = true; // Ingest does not do any pruning, but the flag affects validation.
@@ -405,7 +407,7 @@ mod tests {
         assert!(result.is_ok());
 
         // 2. Create an operation which is from an "outdated" seq from before the log was pruned.
-        let header = Header::builder().build(&signing_key, ());
+        let header = Header::builder().build(&signing_key, ()).unwrap();
         let operation = Operation::from_parts(header, None);
 
         let result = ingest_operation(&store, None, &operation, &1, &1, false).await;

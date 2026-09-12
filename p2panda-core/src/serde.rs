@@ -362,9 +362,10 @@ mod tests {
         assert_serde_roundtrip(
             Header::builder()
                 .body(b"test")
-                .build(&signing_key, extensions),
+                .build(&signing_key, extensions)
+                .unwrap(),
         );
-        assert_serde_roundtrip(Header::builder().build(&signing_key, ()));
+        assert_serde_roundtrip(Header::builder().build(&signing_key, ()).unwrap());
     }
 
     #[test]
@@ -375,7 +376,7 @@ mod tests {
         ]);
 
         // header at seq num 0
-        let header = Header::builder().build(&signing_key, ());
+        let header = Header::builder().build(&signing_key, ()).unwrap();
 
         let bytes = vec![
             133, 1, 88, 32, 228, 21, 196, 25, 12, 199, 241, 100, 122, 89, 46, 191, 142, 95, 144,
@@ -395,7 +396,8 @@ mod tests {
         // header at seq num 0 with body
         let header = Header::builder()
             .body(b"Hello, Sloth!")
-            .build(&signing_key, ());
+            .build(&signing_key, ())
+            .unwrap();
 
         let bytes = vec![
             134, 1, 88, 32, 228, 21, 196, 25, 12, 199, 241, 100, 122, 89, 46, 191, 142, 95, 144,
@@ -417,7 +419,8 @@ mod tests {
         // header at seq num 1 with backlink
         let header = Header::builder()
             .chain(1, header.hash())
-            .build(&signing_key, ());
+            .build(&signing_key, ())
+            .unwrap();
 
         let bytes = vec![
             134, 1, 88, 32, 228, 21, 196, 25, 12, 199, 241, 100, 122, 89, 46, 191, 142, 95, 144,
@@ -461,14 +464,17 @@ mod tests {
 
         let signing_key = SigningKey::generate();
 
-        let header = Header::builder().body(b"look, no bytes!").build(
-            &signing_key,
-            ZeroSizedExtension {
-                field_a: [],
-                field_b: (),
-                field_c: Zilch,
-            },
-        );
+        let header = Header::builder()
+            .body(b"look, no bytes!")
+            .build(
+                &signing_key,
+                ZeroSizedExtension {
+                    field_a: [],
+                    field_b: (),
+                    field_c: Zilch,
+                },
+            )
+            .unwrap();
 
         let bytes = header.encode();
 

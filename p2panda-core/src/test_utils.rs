@@ -59,7 +59,9 @@ impl TestLog {
             header = header.chain(*seq_num, backlink);
         }
 
-        let header = header.build(&self.signing_key, extensions);
+        let header = header
+            .build(&self.signing_key, extensions)
+            .expect("test_utils operations stay well under MAX_HEADER_ITEM_LEN");
 
         *backlink = Some(header.hash());
         *seq_num += 1;
@@ -79,7 +81,10 @@ mod tests {
     #[test]
     fn zero_byte_body() {
         let signing_key = SigningKey::generate();
-        let header = Header::builder().body(&[]).build(&signing_key, ());
+        let header = Header::builder()
+            .body(&[])
+            .build(&signing_key, ())
+            .unwrap();
 
         // Assure that setting an _empty_ body is equals having no body at all.
         assert_eq!(header.payload_size, 0);

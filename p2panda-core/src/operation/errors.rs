@@ -45,6 +45,9 @@ pub enum HeaderError {
 
     #[error("failed encoding CBOR byte string for extensions: {0}")]
     EncodingExtensions(cbor_core::SerdeError),
+
+    #[error("encoded header is {len} bytes, exceeds the {max} byte limit (D3-o)")]
+    TooLarge { len: usize, max: usize },
 }
 
 #[derive(Clone, Debug, PartialEq, Error)]

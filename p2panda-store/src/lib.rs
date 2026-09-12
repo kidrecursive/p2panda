@@ -79,7 +79,7 @@
 //!         .seq_num(seq_num)
 //!         .backlink(backlink)
 //!         .body(&body)
-//!         .build(&signing_key, ());
+//!         .build(&signing_key, ())?;
 //!
 //!     <SqliteStore as TopicStore<Topic, VerifyingKey, u64>>::associate(
 //!         &store,

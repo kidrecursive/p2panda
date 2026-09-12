@@ -124,7 +124,8 @@ pub trait Offchain<ID> {
 ///
 /// let header = Header::builder()
 ///     .body("Hello, Sloth".as_bytes())
-///     .build(&signing_key, extensions.clone());
+///     .build(&signing_key, extensions.clone())
+///     .unwrap();
 ///
 /// assert_eq!(header.extensions.expires, 1787246796);
 /// ```

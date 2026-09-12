@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::identity::SigningKey;
 use crate::traits::Provenance;
-use crate::{AnyHeader, Body, Hash, Header, HeaderError};
+use crate::{AnyHeader, Body, Hash, Header, HeaderError, MAX_HEADER_ITEM_LEN};
 
 #[test]
 fn paths_leading_to_same_encoding() {
@@ -13,7 +13,8 @@ fn paths_leading_to_same_encoding() {
     let header = Header::builder()
         .body(b"test")
         .chain(2, Hash::from([2; 32]))
-        .build(&signing_key, ());
+        .build(&signing_key, ())
+        .unwrap();
 
     let hacky_header = {
         let body = Body::from_bytes(b"test");
@@ -58,14 +59,17 @@ fn any_header_conversions() {
         field_c: u64,
     }
 
-    let header = Header::builder().body(b"hello").build(
-        &signing_key,
-        TestExtensions {
-            field_a: vec![61, 112, 43],
-            field_b: true,
-            field_c: 54_938,
-        },
-    );
+    let header = Header::builder()
+        .body(b"hello")
+        .build(
+            &signing_key,
+            TestExtensions {
+                field_a: vec![61, 112, 43],
+                field_b: true,
+                field_c: 54_938,
+            },
+        )
+        .unwrap();
 
     let hash = header.hash();
     assert!(header.verify());
@@ -115,14 +119,14 @@ fn any_header_errors() {
     );
 
     // Invalid signature.
-    let mut header = Header::builder().build(&signing_key, ());
+    let mut header = Header::builder().build(&signing_key, ()).unwrap();
     header.verifying_key = SigningKey::generate().verifying_key();
 
     let result = AnyHeader::decode(&header.encode());
     std::assert_matches!(result, Err(HeaderError::InvalidSignature));
 
     // payload_size given without payload_hash.
-    let mut header = Header::builder().build(&signing_key, ());
+    let mut header = Header::builder().build(&signing_key, ()).unwrap();
     header.payload_size = 2829099;
     header.sign(&signing_key);
 
@@ -204,12 +208,15 @@ fn forwards_compatible_checks() {
 
     let signing_key = SigningKey::generate();
 
-    let old_header = Header::builder().body(b"once upon a time").build(
-        &signing_key,
-        LegacyExtensionsFormat {
-            timestamp: 1780572316919.into(),
-        },
-    );
+    let old_header = Header::builder()
+        .body(b"once upon a time")
+        .build(
+            &signing_key,
+            LegacyExtensionsFormat {
+                timestamp: 1780572316919.into(),
+            },
+        )
+        .unwrap();
     let old_header_bytes = old_header.encode();
 
     let new_header = Header::builder()
@@ -220,7 +227,8 @@ fn forwards_compatible_checks() {
                 timestamp: 1780572316919.into(),
                 prune_flag: true.into(),
             },
-        );
+        )
+        .unwrap();
     let new_header_bytes = new_header.encode();
     let new_header_hash = new_header.hash();
 
@@ -293,4 +301,56 @@ fn non_canonical_extensions() {
             cbor_core::Error::NonDeterministic
         ))
     );
+}
+
+/// D3-o (`docs/upstream/p2panda-header-length-limit.md`): a header carrying a 4 KiB
+/// `extensions` payload -- comfortably above the old 512 B decode limit, comfortably below the
+/// new 64 KiB one -- round-trips through encode/decode/re-decode.
+#[test]
+fn header_with_4kib_extensions_round_trips() {
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    struct LargeExtensions {
+        ciphertext: Vec<u8>,
+    }
+
+    let signing_key = SigningKey::generate();
+    let extensions = LargeExtensions {
+        ciphertext: vec![7u8; 4 * 1024],
+    };
+
+    let header = Header::builder()
+        .build(&signing_key, extensions.clone())
+        .expect("4 KiB extensions stay well under MAX_HEADER_ITEM_LEN");
+
+    let bytes = header.encode();
+    let decoded = Header::<LargeExtensions>::decode(&bytes).expect("decodes within the limit");
+
+    assert_eq!(header, decoded);
+    assert_eq!(decoded.extensions, extensions);
+}
+
+/// D3-o: a header whose `extensions` would encode past [`MAX_HEADER_ITEM_LEN`] is rejected at
+/// build time (`HeaderError::TooLarge`) -- it must never be possible to sign, store or transmit
+/// an operation whose own header can't be decoded again.
+#[test]
+fn header_over_limit_fails_at_build_not_decode() {
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    struct OversizeExtensions {
+        ciphertext: Vec<u8>,
+    }
+
+    let signing_key = SigningKey::generate();
+    let extensions = OversizeExtensions {
+        // Comfortably over MAX_HEADER_ITEM_LEN once CBOR-encoded (byte string overhead is a few
+        // bytes, so this alone exceeds the limit).
+        ciphertext: vec![9u8; MAX_HEADER_ITEM_LEN + 1024],
+    };
+
+    let result = Header::builder().build(&signing_key, extensions);
+
+    std::assert_matches!(result, Err(HeaderError::TooLarge { .. }));
+    if let Err(HeaderError::TooLarge { len, max }) = result {
+        assert_eq!(max, MAX_HEADER_ITEM_LEN);
+        assert!(len > MAX_HEADER_ITEM_LEN);
+    }
 }

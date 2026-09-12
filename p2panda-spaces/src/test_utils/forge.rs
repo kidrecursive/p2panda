@@ -44,7 +44,8 @@ impl Forge<TestConditions> for TestForge {
             let header = Header::builder()
                 .seq_num(seq_num)
                 .backlink(backlink)
-                .build(&self.signing_key, args);
+                .build(&self.signing_key, args)
+                .expect("test_utils operations stay well under MAX_HEADER_ITEM_LEN");
 
             let operation = TestOperation::from_parts(header, None);
 

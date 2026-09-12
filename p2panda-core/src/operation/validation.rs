@@ -124,7 +124,8 @@ mod tests {
 
         let header = Header::<CustomExtensions>::builder()
             .body(&body)
-            .build(&signing_key, (42, "penguin".to_string()));
+            .build(&signing_key, (42, "penguin".to_string()))
+            .unwrap();
         assert!(header.verify());
 
         let operation = Operation {
@@ -139,12 +140,13 @@ mod tests {
     fn valid_backlink_header() {
         let signing_key = SigningKey::generate();
 
-        let header_0 = Header::builder().build(&signing_key, ());
+        let header_0 = Header::builder().build(&signing_key, ()).unwrap();
         assert!(validate_header(&header_0).is_ok());
 
         let header_1 = Header::builder()
             .chain(1, header_0.hash())
-            .build(&signing_key, ());
+            .build(&signing_key, ())
+            .unwrap();
         assert!(validate_header(&header_1).is_ok());
 
         assert!(validate_backlink(&header_0, &header_1).is_ok());

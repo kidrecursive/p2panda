@@ -316,7 +316,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .seq_num(seq_num)
                 .backlink(backlink)
                 .body(&body)
-                .build(&signing_key, ());
+                .build(&signing_key, ())
+                .expect("example operations stay well under MAX_HEADER_ITEM_LEN");
 
             let operation = Operation::from_parts(header, Some(body));
             let hash = operation.hash;

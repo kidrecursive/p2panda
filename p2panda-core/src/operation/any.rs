@@ -123,7 +123,7 @@ impl<E> From<Operation<E>> for AnyOperation {
 /// let header = Header::builder()
 ///     .build(&signing_key, MyExtensions {
 ///         dependencies: vec![Hash::from([0; 32])],
-///     });
+///     })?;
 ///
 /// // Encode it to CBOR bytes, this is how we transmit operations over the network.
 /// let bytes = header.encode();
@@ -199,8 +199,19 @@ impl AnyHeader {
                 // details.
                 .strictness(cbor_core::Strictness::STRICT)
                 // Make sure some attacks are mitigated and set rather low / pessimistic thresholds.
+                //
+                // `length_limit` caps every CBOR item in the header, including the `extensions`
+                // byte string. Raised from 512 B to `MAX_HEADER_ITEM_LEN` (D3-o,
+                // `docs/upstream/p2panda-header-length-limit.md`): p2panda-spaces carries
+                // application ciphertext in `extensions`, so the header grows with the payload
+                // size. `Builder::build` enforces the same bound at encode time, so a header this
+                // decoder accepts was also one we were willing to sign and store.
                 .recursion_limit(64)
-                .length_limit(512) // 0.5kb
+                .length_limit(crate::operation::MAX_HEADER_ITEM_LEN as u64)
+                // Kept at its original, independently-chosen value: `oom_mitigation` bounds a
+                // separate, coarser allocation budget than `length_limit`'s per-item cap; raising
+                // `length_limit` does not change how many discrete items a header can validly
+                // contain, so it stays as-is.
                 .oom_mitigation(64);
 
             codec.decode(bytes).map_err(HeaderError::DecodingHeader)?

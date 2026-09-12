@@ -345,7 +345,8 @@ pub fn create_operation(
         .seq_num(seq_num)
         .backlink(backlink)
         .body(&body)
-        .build(signing_key, ());
+        .build(signing_key, ())
+        .expect("test_utils operations stay well under MAX_HEADER_ITEM_LEN");
 
     let header_bytes = header.encode();
 

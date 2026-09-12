@@ -13,7 +13,10 @@ fn main() {
     let body = Body::from_bytes("Hello, Sloth!".as_bytes());
 
     // Create and sign a header.
-    let header = Header::builder().body(&body).build(&signing_key, ());
+    let header = Header::builder()
+        .body(&body)
+        .build(&signing_key, ())
+        .expect("header stays well under MAX_HEADER_ITEM_LEN");
 
     // An operation containing the header hash (the operation id), the header itself and an optional body.
     let operation = Operation {

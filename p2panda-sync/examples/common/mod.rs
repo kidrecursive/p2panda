@@ -47,7 +47,8 @@ where
             .seq_num(seq_num)
             .backlink(backlink)
             .body(&body)
-            .build(signer, extensions);
+            .build(signer, extensions)
+            .expect("example operations stay well under MAX_HEADER_ITEM_LEN");
 
         <SqliteStore as TopicStore<Topic, VerifyingKey, LogId>>::associate(
             &store,

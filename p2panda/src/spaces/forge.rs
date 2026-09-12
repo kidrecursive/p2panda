@@ -203,14 +203,12 @@ impl p2panda_spaces::Forge<AuthCapabilities> for OperationForge {
             }
 
             // 4. Application logs.
-            p2panda_spaces::SpacesArgs::Application {
-                space_id,
-                ref ciphertext,
-                ..
-            } => {
-                // TODO: This should be plaintext. We encrypt _later_ in the processor.
-                let _body = ciphertext.clone();
-
+            p2panda_spaces::SpacesArgs::Application { space_id, .. } => {
+                // TODO: This should be plaintext. We encrypt _later_ in the processor. The
+                // ciphertext is carried in the header `extensions` (via `Extensions::builder`
+                // below), not in the operation body -- upstream's own TODO above; changing that
+                // would change the wire format (D3-o, `docs/upstream/p2panda-header-length-limit.md`).
+                //
                 // Every author maintains their own log of application messages _per_ space.
                 let log_id = logid_digest_from_slices! (
                     space_id.as_bytes() => p2panda_core::hash::HASH_LEN,

@@ -109,8 +109,8 @@ pub use hash::{Hash, HashError};
 pub use identity::{IdentityError, Signature, SigningKey, VerifyingKey};
 pub use logs::{LogId, SeqNum};
 pub use operation::{
-    AnyHeader, AnyOperation, Body, Header, HeaderError, Operation, OperationError, RawOperation,
-    validate_backlink, validate_header, validate_operation,
+    AnyHeader, AnyOperation, Body, Header, HeaderError, MAX_HEADER_ITEM_LEN, Operation,
+    OperationError, RawOperation, validate_backlink, validate_header, validate_operation,
 };
 pub use prune::PruneFlag;
 pub use timestamp::Timestamp;

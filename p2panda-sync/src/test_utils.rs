@@ -219,7 +219,8 @@ pub fn create_operation(
         .body(body)
         .seq_num(seq_num)
         .backlink(backlink)
-        .build(signing_key, log_id);
+        .build(signing_key, log_id)
+        .expect("test_utils operations stay well under MAX_HEADER_ITEM_LEN");
     let header_bytes = header.encode();
     (header, header_bytes)
 }
