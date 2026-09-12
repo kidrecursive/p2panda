@@ -182,14 +182,42 @@ where
                 topic,
                 live_mode,
             } => {
+                state.active_sync_set.insert(node_id);
+
+                // square-tower fork addition (D3-k): don't spawn a second concurrent session for
+                // a peer+topic pair that already has one running. Without this, a burst of
+                // `Initiate` calls for the same peer (e.g. gossip's `Joined`/`NeighbourUp` firing
+                // for several nodes at once, or the node-side periodic resync racing an
+                // in-flight session) can create multiple simultaneous sessions for the same
+                // (node_id, topic); each session delivers a *different log's* operations with no
+                // cross-log ordering guarantee between them, which can violate a cross-log causal
+                // dependency (e.g. `p2panda-spaces`'s `SpaceMembership` message referencing a
+                // groups-log operation that a *different*, concurrently-running session hasn't
+                // delivered yet) -- the dependent operation then fails once, non-retryably, with
+                // no error surfaced anywhere above the spaces manager (M4-07,
+                // `docs/upstream/p2panda-manual-resync.md`). `Retry` already had this exact guard
+                // (`current_sessions.is_empty()` below); `Initiate` now matches it.
+                let current_sessions = state
+                    .node_session_map
+                    .get(&node_id)
+                    .cloned()
+                    .unwrap_or_default();
+                if !current_sessions.is_empty() {
+                    debug!(
+                        remote_node_id = %node_id.fmt_short(),
+                        topic = %topic.fmt_short(),
+                        %live_mode,
+                        "skip initiate sync: other sync sessions already running with this node"
+                    );
+                    return Ok(());
+                }
+
                 debug!(
                     remote_node_id = %node_id.fmt_short(),
                     topic = %topic.fmt_short(),
                     %live_mode,
                     "initiate sync session"
                 );
-
-                state.active_sync_set.insert(node_id);
                 let config = SessionConfig {
                     topic,
                     remote: node_id,
