@@ -26,8 +26,12 @@ use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::RecvError;
 use tracing::error;
 
+use p2panda_spaces::identity::IdentityError;
+
+use crate::forge::ForgeError;
 use crate::operation::Extensions;
 use crate::spaces::authoriser::update_authoriser;
+use crate::spaces::forge::SpacesForgeError;
 use crate::spaces::member::associate_members;
 use crate::spaces::message::SpacesMessage;
 use crate::spaces::types::{AuthCapabilities, InnerSpace, InnerSpaceError, SpacesManagerError};
@@ -636,4 +640,27 @@ pub enum PublishSpaceError {
 
     #[error(transparent)]
     RepairSpace(#[from] RepairError),
+}
+
+impl PublishSpaceError {
+    /// True if the underlying cause is the fork's header-length cap (D3-o,
+    /// `p2panda_core::HeaderError::TooLarge`) being hit while forging the operation for this
+    /// publish, and not any other kind of failure.
+    ///
+    /// Exposed as a method rather than requiring callers to downcast/pattern-match the chain
+    /// themselves: the intermediate error types between here and `HeaderError`
+    /// (`SpacesForgeError`, `ForgeError`) are private to this crate, and `IdentityError::Forge`'s
+    /// field isn't wired up as an `Error::source()` (it holds a generic `F::Error`, displayed via
+    /// `#[error("{0}")]` rather than `#[source]`), so a source-chain downcast from outside this
+    /// crate can't reach it either way.
+    pub fn is_header_too_large(&self) -> bool {
+        matches!(
+            self,
+            PublishSpaceError::Space(InnerSpaceError::IdentityManager(IdentityError::Forge(
+                SpacesForgeError::Forge(ForgeError::Header(p2panda_core::HeaderError::TooLarge {
+                    ..
+                }))
+            )))
+        )
+    }
 }
