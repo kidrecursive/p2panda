@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use futures_util::{FutureExt, Stream, StreamExt};
@@ -46,6 +47,10 @@ pub(crate) fn spaces_stream<M>(
     rx: StreamSubscription<M>,
     // TODO: Only required until https://github.com/p2panda/p2panda/issues/1362 is resolved.
     connection_authoriser: ConnectionAuthoriser,
+    // D3-m: shared with `Node` -- serialises this space's local-control writes of the GLOBAL
+    // groups state against `Node::create_space` and every sibling `Space`'s own writes. See the
+    // field doc on `Node::control_lock`.
+    control_lock: Arc<tokio::sync::Mutex<()>>,
 ) -> (Space<M>, SpaceSubscription<M>)
 where
     M: Serialize,
@@ -65,6 +70,7 @@ where
             key_bundle_task_tx,
             tx,
             connection_authoriser,
+            control_lock,
         },
         SpaceSubscription { rx },
     )
@@ -81,6 +87,7 @@ where
     key_bundle_task_tx: KeyBundleTaskSender,
     tx: StreamPublisher<M>,
     connection_authoriser: ConnectionAuthoriser,
+    control_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl<M> Drop for Space<M>
@@ -171,6 +178,13 @@ where
         // ensure we have incorporated the latest groups changes into the space.
         self.repair().await?;
 
+        // D3-m: acquire AFTER `repair()` (acquiring before deadlocks with the `RepairTask`
+        // oneshot, which itself may await this same lock via a concurrent `Node::create_space` or
+        // sibling `Space` write) and BEFORE reading the global groups state via `self.inner.add`.
+        // Dropped inside `process_change`, right after the persist `tx!`, before
+        // `import_local`/`processed.await`.
+        let guard = self.control_lock.lock().await;
+
         let (groups_y, space_y, auth_message, space_message, events) = self
             .inner
             .add(
@@ -185,7 +199,7 @@ where
         // TODO: Only required until https://github.com/p2panda/p2panda/issues/1362 is resolved.
         update_authoriser(&self.connection_authoriser, &events).await;
 
-        self.process_change(groups_y, space_y, [auth_message, space_message], events)
+        self.process_change(guard, groups_y, space_y, [auth_message, space_message], events)
             .await?;
 
         Ok(())
@@ -208,13 +222,16 @@ where
         // ensure we have incorporated the latest groups changes into the space.
         self.repair().await?;
 
+        // D3-m: see `add`'s comment on lock placement.
+        let guard = self.control_lock.lock().await;
+
         let (groups_y, space_y, auth_message, space_message, events) =
             self.inner.remove(actor).await?;
 
         // TODO: Only required until https://github.com/p2panda/p2panda/issues/1362 is resolved.
         update_authoriser(&self.connection_authoriser, &events).await;
 
-        self.process_change(groups_y, space_y, [auth_message, space_message], events)
+        self.process_change(guard, groups_y, space_y, [auth_message, space_message], events)
             .await?;
 
         Ok(())
@@ -243,6 +260,9 @@ where
         // ensure we have incorporated the latest groups changes into the space.
         self.repair().await?;
 
+        // D3-m: see `add`'s comment on lock placement.
+        let guard = self.control_lock.lock().await;
+
         let (groups_y, space_y, auth_message, space_message, events) = self
             .inner
             .promote(
@@ -254,7 +274,7 @@ where
             )
             .await?;
 
-        self.process_change(groups_y, space_y, [auth_message, space_message], events)
+        self.process_change(guard, groups_y, space_y, [auth_message, space_message], events)
             .await?;
 
         Ok(())
@@ -283,6 +303,9 @@ where
         // ensure we have incorporated the latest groups changes into the space.
         self.repair().await?;
 
+        // D3-m: see `add`'s comment on lock placement.
+        let guard = self.control_lock.lock().await;
+
         let (groups_y, space_y, auth_message, space_message, events) = self
             .inner
             .demote(
@@ -294,7 +317,7 @@ where
             )
             .await?;
 
-        self.process_change(groups_y, space_y, [auth_message, space_message], events)
+        self.process_change(guard, groups_y, space_y, [auth_message, space_message], events)
             .await?;
 
         Ok(())
@@ -302,6 +325,12 @@ where
 
     async fn process_change(
         &self,
+        // D3-m: held from just before the global groups state was read (in `add`/`remove`/
+        // `promote`/`demote`, immediately before `self.inner.*`) through the persist `tx!` below;
+        // dropped here, before `import_local`/`processed.await` -- holding it across that pipeline
+        // would deadlock against a concurrent `Node::create_space` or sibling `Space` write
+        // blocked on the same lock while control's per-topic `consume` tasks await processing.
+        guard: tokio::sync::MutexGuard<'_, ()>,
         groups_y: AuthGroupState<AuthCapabilities>,
         space_y: SpacesState<AuthCapabilities>,
         messages: [SpacesMessage; 2],
@@ -314,6 +343,16 @@ where
 
         let spaces_store = SqliteSpacesStore::<Extensions>::new(self.store.clone());
 
+        #[cfg(feature = "test-hooks")]
+        {
+            // Widens the read -> persist race window deterministically under test so
+            // `global_groups_state_survives_concurrent_create_space_and_add` can prove the lock
+            // (rather than timing luck) prevents the lost update.
+            tokio::task::yield_now().await;
+            let jitter_ms = rand::random::<u64>() % 6;
+            tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
+        }
+
         tx!(spaces_store, {
             // Persist the computed groups and spaces state to the stores.
             spaces_store
@@ -323,6 +362,8 @@ where
                 .set_space_state_tx(&self.id(), &SpacesStoreState::from(space_y))
                 .await?;
         });
+
+        drop(guard);
 
         let processed = self
             .tx

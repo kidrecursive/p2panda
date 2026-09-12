@@ -1389,3 +1389,141 @@ mod has_space {
         );
     }
 }
+
+/// D3-m: `Node::create_space` and `Space::add` (via `Space::process_change`) both
+/// read -> forge -> persist the GLOBAL groups state (`GLOBAL_GROUPS_CONTEXT_ID`) without
+/// serialisation. Under `#[cfg(feature = "test-hooks")]` a jitter hook widens the natural ~2ms
+/// race window between the two so this test fails deterministically without the
+/// `Node`-owned `control_lock` (`docs/upstream/p2panda-local-control-lock.md`; the exact
+/// mechanism behind the residual documented in
+/// `docs/upstream/p2panda-spaces-repair-snapshot.md`'s "Residual" section, card M4-08).
+mod global_groups_state_race {
+    use std::time::Duration;
+
+    use p2panda::network::MdnsDiscoveryMode;
+    use p2panda::{Hash, Node, NetworkId, Topic};
+    use p2panda_auth::AccessLevel;
+    use p2panda_core::test_utils::setup_logging;
+    use p2panda_spaces::AuthGroupState;
+    use p2panda_spaces::manager::GLOBAL_GROUPS_CONTEXT_ID;
+    use p2panda_store::groups::GroupsStore;
+
+    // mDNS off (unlike `super::spawn_node`) -- this test spawns 100+ throwaway member nodes
+    // purely for their local identity/key-bundle material (`register_member`, never networked),
+    // and mDNS's continuous advertise/listen retries otherwise dominate the single `current_thread`
+    // executor this test needs to stay deterministic and fast.
+    async fn spawn_member_node(network_id: NetworkId) -> Node {
+        p2panda::builder()
+            .network_id(network_id)
+            .mdns_mode(MdnsDiscoveryMode::Disabled)
+            .spawn()
+            .await
+            .unwrap()
+    }
+
+    async fn groups_global_count(control: &Node) -> usize {
+        let store = control.store();
+        let y: AuthGroupState<()> = p2panda_store::tx_unwrap!(store, {
+            store
+                .get_groups_state_tx(Hash::digest(GLOBAL_GROUPS_CONTEXT_ID))
+                .await
+        })
+        .unwrap()
+        .unwrap_or_default();
+        y.groups_global().len()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn global_groups_state_survives_concurrent_create_space_and_add() {
+        setup_logging();
+
+        let network_id = Topic::random().into();
+        let control = spawn_member_node(network_id).await;
+
+        // Two actors, registered once up front (purely local, no network sync needed -- mirrors
+        // `members::indirect_members_log_sync`'s `register_member` use). Spawning a fresh full
+        // `Node` (with its own network stack) per round for 50 rounds would itself dominate the
+        // 60s deadlock budget below, so both actors are reused across every round: `actor_a` is
+        // added to space A once and then promoted/demoted on alternating rounds (an actual global
+        // groups state write, racing `Node::create_space` each time, without needing a fresh
+        // identity); `actor_new` is added fresh to each round's brand-new space (never a repeat
+        // add on the same space, so no "already added" conflict).
+        let actor_a = spawn_member_node(network_id).await;
+        control
+            .register_member(actor_a.me().await.unwrap())
+            .await
+            .unwrap();
+
+        let actor_new = spawn_member_node(network_id).await;
+        control
+            .register_member(actor_new.me().await.unwrap())
+            .await
+            .unwrap();
+
+        // Space A, with `actor_a` added below each round (alternating promote/demote) so
+        // `Space::add`'s sibling mutators have a concurrent writer to race `Node::create_space`
+        // against.
+        let space_a_topic = Topic::random();
+        let (space_a, _space_a_rx) = control
+            .create_space::<String>(space_a_topic)
+            .await
+            .unwrap();
+
+        space_a.add(actor_a.id(), AccessLevel::Read).await.unwrap();
+
+        let mut expected_group_count = groups_global_count(&control).await;
+        assert_eq!(
+            expected_group_count, 1,
+            "space A's own group must exist right after creation"
+        );
+
+        let result = tokio::time::timeout(Duration::from_secs(60), async {
+            for round in 0..50u32 {
+                let new_space_topic = Topic::random();
+
+                let (create_result, mutate_result): (_, Result<(), String>) = if round % 2 == 0 {
+                    let (create_result, promote_result) = tokio::join!(
+                        control.create_space::<String>(new_space_topic),
+                        space_a.promote(actor_a.id(), AccessLevel::Write),
+                    );
+                    (create_result, promote_result.map_err(|err| err.to_string()))
+                } else {
+                    let (create_result, demote_result) = tokio::join!(
+                        control.create_space::<String>(new_space_topic),
+                        space_a.demote(actor_a.id(), AccessLevel::Read),
+                    );
+                    (create_result, demote_result.map_err(|err| err.to_string()))
+                };
+
+                let (new_space, _new_space_rx) = create_result
+                    .unwrap_or_else(|err| panic!("round {round}: create_space failed: {err}"));
+                mutate_result.unwrap_or_else(|err| {
+                    panic!("round {round}: space_a promote/demote failed: {err}")
+                });
+
+                expected_group_count += 1;
+                let actual = groups_global_count(&control).await;
+                assert_eq!(
+                    actual, expected_group_count,
+                    "round {round}: lost a group Create under concurrent create_space/add \
+                     (expected {expected_group_count} groups globally, found {actual})"
+                );
+
+                new_space
+                    .add(actor_new.id(), AccessLevel::Read)
+                    .await
+                    .unwrap_or_else(|err| {
+                        panic!("round {round}: new_space.add failed: {err} (this space's own \
+                                group Create was lost)")
+                    });
+            }
+        })
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "test deadlocked (60s timeout) -- check the lock-ordering comments in \
+             Node::create_space / Space::{{add,remove,promote,demote}}/process_change"
+        );
+    }
+}

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::fmt::Debug;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use futures_util::Stream;
 use p2panda_core::traits::ShortFormat;
@@ -58,6 +58,11 @@ pub struct Node {
     events_tx: broadcast::Sender<SystemEvent>,
     events_rx: Mutex<broadcast::Receiver<SystemEvent>>,
     connection_authoriser: ConnectionAuthoriser,
+    // D3-m: serialises every local-control read -> forge -> persist of the GLOBAL groups state
+    // (`GLOBAL_GROUPS_CONTEXT_ID`) across `Node::create_space` and every `Space::{add,remove,
+    // promote,demote}` (via `process_change`), which otherwise race on read-modify-write of the
+    // same blob and silently drop one writer's change (docs/upstream/p2panda-local-control-lock.md).
+    control_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Node {
@@ -133,6 +138,8 @@ impl Node {
 
         let (events_tx, events_rx) = broadcast::channel::<SystemEvent>(256);
 
+        let control_lock = Arc::new(tokio::sync::Mutex::new(()));
+
         Ok(Node {
             config,
             store,
@@ -145,6 +152,7 @@ impl Node {
             events_tx,
             events_rx: Mutex::new(events_rx),
             connection_authoriser,
+            control_lock,
         })
     }
 
@@ -606,6 +614,7 @@ impl Node {
             tx,
             rx,
             self.connection_authoriser.clone(),
+            self.control_lock.clone(),
         ))
     }
 
@@ -655,8 +664,31 @@ impl Node {
         // members. I (sam) removed it from the API for now as without a manual member
         // registration flow a user likely doesn't have access to any member key bundles at the
         // point of space creation.
+        //
+        // D3-m: the global groups state (`GLOBAL_GROUPS_CONTEXT_ID`) is read here (inside
+        // `spaces_manager.create_space`) and replaced below in the persist `tx!`. A concurrent
+        // `Space::add`/`remove`/`promote`/`demote` on a sibling space does the same read -> forge
+        // -> replace; without serialisation the later write wins and silently drops the other's
+        // change (docs/upstream/p2panda-local-control-lock.md). The lock is acquired here, BEFORE
+        // the read, and released right after the persist `tx!` below -- before the association
+        // `tx!` and before `import_local`/`processed.await`, since holding it across that pipeline
+        // would deadlock against a concurrent `Space::add` awaiting the same lock inside its own
+        // `process_change` while control's per-topic `consume` tasks are also waiting on
+        // `processed.await` for this space's own import.
+        let guard = self.control_lock.lock().await;
+
         let (groups_y, space_y, create_space_messages, events) =
             self.spaces_manager.create_space(space_id, &[]).await?;
+
+        #[cfg(feature = "test-hooks")]
+        {
+            // Widens the read -> persist race window deterministically under test so
+            // `global_groups_state_survives_concurrent_create_space_and_add` can prove the lock
+            // (rather than timing luck) prevents the lost update.
+            tokio::task::yield_now().await;
+            let jitter_ms = rand::random::<u64>() % 6;
+            tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
+        }
 
         // Persist the computed groups- and spaces-state to the stores.
         tx!(self.store, {
@@ -668,6 +700,8 @@ impl Node {
                 .set_space_state_tx(&space_id, &SpacesStoreState::from(space_y))
                 .await?;
         });
+
+        drop(guard);
 
         // D3-l (T2): mirror `space_from`'s restart-path association loop below -- if any sibling
         // groups already existed globally at the moment this space was created (eg. control
@@ -747,6 +781,7 @@ impl Node {
             tx,
             rx,
             self.connection_authoriser.clone(),
+            self.control_lock.clone(),
         );
 
         Ok((space, rx))

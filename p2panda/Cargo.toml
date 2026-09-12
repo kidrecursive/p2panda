@@ -26,6 +26,11 @@ default = []
 test_utils = [
   "dep:tracing-subscriber",
 ]
+# D3-m: widens the read -> persist race window on the global groups state deterministically, so
+# `global_groups_state_survives_concurrent_create_space_and_add` proves the `control_lock` (rather
+# than timing luck) prevents the lost update. See `node.rs`'s `create_space` and
+# `spaces/space.rs`'s `process_change`.
+test-hooks = []
 
 [dependencies]
 futures-util = { workspace = true }
@@ -42,7 +47,7 @@ rand = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 static_assertions.workspace = true
 thiserror = { workspace = true }
-tokio = { workspace = true, default-features = true, features = ["sync"] }
+tokio = { workspace = true, default-features = true, features = ["sync", "time", "rt"] }
 tokio-stream = { workspace = true, features = ["sync"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }

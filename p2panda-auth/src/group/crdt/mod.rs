@@ -729,6 +729,18 @@ where
             (y.inner.current_state(), y.inner.ignore.clone())
         };
 
+        // D3-m: a non-Create action on a group absent from this (possibly rebuilt) state means
+        // the state this operation depends on never had the group's Create -- eg. a forged `Add`
+        // whose `auth_dependencies` came back empty because the wrapper's global-groups-state
+        // read raced a concurrent write that hadn't yet persisted the group's Create (see
+        // `docs/upstream/p2panda-local-control-lock.md`). Without this guard `apply_action` below
+        // panics at its `.expect("group missing from states map")` (mirrors the already-existing
+        // guard in `process` at L642-644, which only runs on the *no-rebuild* path and therefore
+        // never protects this rebuild path).
+        if !operation.action().is_create() && !groups_y.contains_key(&operation.group_id()) {
+            return Err(GroupCrdtError::UnknownGroup(operation.group_id()));
+        }
+
         // Apply the operation onto the temporary state.
         let result = apply_action(
             groups_y,
@@ -825,7 +837,7 @@ where
     } else {
         groups_y
             .remove(&group_id)
-            .expect("group already present in states map")
+            .expect("group missing from states map")
     };
 
     if filter.contains(&id) {
@@ -899,7 +911,7 @@ where
 {
     let mut members_y = groups_y
         .remove(&group_id)
-        .expect("group already present in states map");
+        .expect("group missing from states map");
 
     members_y.members.entry(removed).and_modify(|state| {
         if state.member_counter % 2 != 0 {
@@ -1030,6 +1042,36 @@ pub(crate) mod tests {
         assert_eq!(
             members,
             vec![(ALICE, Access::manage()), (CLAIRE, Access::write())]
+        );
+    }
+
+    // D3-m: a non-Create op on a group the state has never seen must be rejected as
+    // `UnknownGroup`, not panic. Before the fix, `validate`'s `apply_action` call hit
+    // `.remove(&group_id).expect(...)` on an empty `groups_y` (the group was never `Create`d),
+    // panicking at `crdt/mod.rs:828` with the inverted message "group already present in states
+    // map" -- the exact mechanism square-tower's control station hit when a forged `Add` on a
+    // space's group (its `Create` lost to a concurrent write of the wrapper's global groups
+    // state) arrived with empty `auth_dependencies`, taking `validate`'s rebuild path.
+    #[test]
+    fn non_create_op_on_unknown_group_is_error_not_panic() {
+        let y = TestGroupState::new();
+
+        let op = add_member(
+            ALICE,
+            0,
+            G1,
+            GroupMember::Individual(BOB),
+            Access::read(),
+            vec![],
+        );
+
+        let result = TestGroup::process(y, &op);
+        assert!(
+            matches!(
+                result,
+                Err(GroupCrdtError::UnknownGroup(group_id)) if group_id == G1
+            ),
+            "expected Err(UnknownGroup(G1)), got {result:?}"
         );
     }
 
