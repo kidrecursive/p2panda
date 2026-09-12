@@ -363,9 +363,25 @@ async fn graceful_session_end_is_not_retried_but_manual_resync_recovers() {
     );
 
     // The fix: a manual resync (what the node-side periodic resync task now calls on an
-    // interval) creates a fresh session and recovers.
-    alice_handle.initiate_session(expected_remote);
-    let event = alice_subscription.next().await.unwrap();
+    // interval) creates a fresh session and recovers. Retried in a bounded loop rather than
+    // called once: `Initiate` now dedupes against an already-running session for this peer+topic
+    // (a *different* fork fix, also part of M4-07 -- `TopicManager::Initiate` skips spawning if
+    // `node_session_map` still shows the just-ended session before its own `ActorTerminated`
+    // cleanup has run), so a resync call that lands in that narrow cleanup window is a same-effect
+    // no-op, not a failure -- exactly what a periodic caller (this test's stand-in for
+    // `runtime::spawn_resync_task`) is expected to tolerate by simply trying again.
+    let event = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            alice_handle.initiate_session(expected_remote);
+            match tokio::time::timeout(Duration::from_millis(200), alice_subscription.next()).await
+            {
+                Ok(event) => break event.unwrap(),
+                Err(_elapsed) => continue,
+            }
+        }
+    })
+    .await
+    .expect("manual resync should eventually start a fresh session");
     assert!(
         matches!(
             event,

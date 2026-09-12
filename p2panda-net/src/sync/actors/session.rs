@@ -72,7 +72,7 @@ where
 
     async fn handle(
         &self,
-        _myself: ActorRef<Self::Msg>,
+        myself: ActorRef<Self::Msg>,
         message: Self::Msg,
         state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
@@ -134,6 +134,23 @@ where
                 connection.close(VarInt::from_u32(0), b"sync protocol accept completed");
             }
         }
+
+        // square-tower fork addition (D3-k): a `SyncSession` actor handles exactly one message
+        // (`Initiate` or `Accept`) in its entire lifetime -- it never expects a second one. Without
+        // an explicit `stop()`, an actor whose single `handle()` call returns `Ok(())` (a session
+        // that ended gracefully, e.g. via `TopicLogSyncMessage::Close`) simply idles forever
+        // instead of triggering the `ActorTerminated` supervision event
+        // `TopicManager::handle_supervisor_evt` relies on to clean up `node_session_map`/
+        // `session_topic_map` -- which in turn silently defeats the new `Initiate` session-dedup
+        // check above (a stale, already-finished session looks "still running" forever) and, more
+        // importantly, is the same reason a gracefully-ended session was never noticed as needing
+        // a retry in the first place. A session that instead errors out of `handle()` (returns
+        // `Err`, e.g. `UnexpectedStreamClosure`) is already covered -- `ActorProcessingErr` makes
+        // ractor emit `ActorFailed`, which already stops the actor -- so this call is only reached
+        // on the graceful path, and reaching it twice (the framework calling `handle()` again
+        // before the stop takes effect) is not possible since `handle()` isn't called concurrently
+        // with itself.
+        myself.stop(None);
         Ok(())
     }
 }
