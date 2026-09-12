@@ -115,6 +115,14 @@ enum SyncBehaviour {
     /// the "graceful end, no error" case `topic_manager.rs`'s `handle_supervisor_evt` never
     /// retries (only `ActorFailed` does).
     Graceful,
+    /// square-tower fork addition (M4-16 review): like `Graceful` (ends with `Ok(())` after the
+    /// same 200ms), but `DummySyncManager::session` additionally emits `SyncFinished` right after
+    /// `SessionCreated` -- unlike every other behaviour in this harness (which never make
+    /// `Manager::is_catch_up_finished` true for a session at all), this lets a test observe
+    /// `TopicManager::Resync`'s "replace a caught-up session" branch (and the deferred
+    /// re-`Initiate` once that session's own natural, ~200ms termination fires) deterministically,
+    /// without depending on real network timing.
+    CaughtUpThenGraceful,
 }
 
 #[derive(Debug)]
@@ -143,7 +151,7 @@ impl Protocol for FailingSyncProtocol {
                 while let Some(_) = stream.next().await {}
                 return Err(SyncError::UnexpectedFailure);
             }
-            SyncBehaviour::Graceful => return Ok(()),
+            SyncBehaviour::Graceful | SyncBehaviour::CaughtUpThenGraceful => return Ok(()),
         }
     }
 }
@@ -220,6 +228,19 @@ impl SyncManagerTrait<Topic> for DummySyncManager<FailingSyncArgs, FailingSyncPr
                 event: DummySyncEvent::SessionCreated,
             })
             .unwrap();
+        // square-tower fork addition (M4-16 review): `SyncBehaviour::CaughtUpThenGraceful` marks
+        // this session as already caught up (see its own doc comment) the moment it's created --
+        // no other behaviour in this harness ever does, so `Manager::is_catch_up_finished` stays
+        // `false` for every session in every other test here (unaffected).
+        if matches!(self.args.behaviour, SyncBehaviour::CaughtUpThenGraceful) {
+            self.event_tx
+                .send(FromSync {
+                    session_id,
+                    remote: config.remote,
+                    event: DummySyncEvent::SyncFinished,
+                })
+                .unwrap();
+        }
         FailingSyncProtocol {
             behaviour: self.args.behaviour.clone(),
         }
@@ -367,8 +388,8 @@ async fn graceful_session_end_is_not_retried_but_manual_resync_recovers() {
     // The session ends gracefully (`SyncBehaviour::Graceful` returns `Ok(())`). Give it time to
     // actually terminate and confirm no second `SessionCreated` appears on its own within a
     // generous window -- this is the defect: `ActorTerminated` alone never retries.
-    let no_auto_retry = tokio::time::timeout(Duration::from_millis(800), alice_subscription.next())
-        .await;
+    let no_auto_retry =
+        tokio::time::timeout(Duration::from_millis(800), alice_subscription.next()).await;
     assert!(
         no_auto_retry.is_err(),
         "a gracefully-ended session must not be retried automatically, but got: {no_auto_retry:?}"
@@ -539,6 +560,233 @@ async fn resync_respects_connection_authoriser_block() {
     assert!(
         blocked.is_err(),
         "a resync must not bypass the ConnectionAuthoriser block, but got: {blocked:?}"
+    );
+
+    alice.shutdown();
+    bob.shutdown();
+}
+
+/// square-tower fork addition (M4-16 review): positive control for `TopicManager::Resync`'s "no
+/// live session" branch -- with the default-permissive authoriser and no prior session, `resync`
+/// must create one, exactly like `initiate_session`. (This harness's `DummySyncManager` never
+/// emits anything resembling the real protocol's `SyncStarted` -- the observable event here is
+/// `SessionCreated`, the same one every other test in this file asserts on.)
+#[tokio::test]
+async fn resync_with_no_live_session_creates_one() {
+    setup_logging();
+
+    let topic = [4; 32].into();
+
+    let (bob_sync_config, _bob_rx) = FailingSyncArgs::new(SyncBehaviour::Graceful);
+    let mut bob = FailingNode::spawn(random(), vec![], bob_sync_config).await;
+
+    let (alice_sync_config, _alice_rx) = FailingSyncArgs::new(SyncBehaviour::Graceful);
+    let alice = FailingNode::spawn(random(), vec![bob.args.node_info()], alice_sync_config).await;
+
+    let alice_handle = {
+        let manager_ref = call!(alice.sync_ref, ToSyncManager::Create, topic, true).unwrap();
+        SyncHandle::new(topic, alice.sync_ref.clone(), manager_ref)
+    };
+    let mut alice_subscription = alice_handle.subscribe().await.unwrap();
+
+    let _bob_handle = {
+        let manager_ref = call!(bob.sync_ref, ToSyncManager::Create, topic, true).unwrap();
+        SyncHandle::new(topic, bob.sync_ref.clone(), manager_ref)
+    };
+
+    let expected_remote = bob.node_id();
+
+    // No prior session at all -- the default-permissive authoriser must let this create one.
+    alice_handle.resync(expected_remote);
+
+    let event = tokio::time::timeout(Duration::from_secs(2), alice_subscription.next())
+        .await
+        .expect("resync with no live session should create one")
+        .unwrap();
+    assert!(
+        matches!(
+            event,
+            Ok(FromSync {
+                session_id: 0,
+                remote,
+                event: DummySyncEvent::SessionCreated
+            }) if remote == expected_remote
+        ),
+        "{event:#?}"
+    );
+
+    alice.shutdown();
+    bob.shutdown();
+}
+
+/// square-tower fork addition (M4-16 review): a resync replacement's deferred re-`Initiate` (fired
+/// once the old, caught-up session actually terminates) must not resurrect a session for a peer
+/// that left `active_sync_set` in the meantime (gossip `NeighbourDown` -> `EndSync`, simulated
+/// directly here via `ToSyncManager::EndSync`). Mutation-proof: reverting the `active_sync_set`
+/// gate in `topic_manager.rs`'s `resume_pending_resync` (and the `Close` handler's own
+/// `pending_resync` removal) makes this test fail -- both runs captured in the PR.
+#[tokio::test]
+async fn close_during_pending_resync_does_not_resurrect_session() {
+    setup_logging();
+
+    let topic = [5; 32].into();
+
+    let (bob_sync_config, _bob_rx) = FailingSyncArgs::new(SyncBehaviour::Graceful);
+    let mut bob = FailingNode::spawn(random(), vec![], bob_sync_config).await;
+
+    let (alice_sync_config, _alice_rx) = FailingSyncArgs::new(SyncBehaviour::CaughtUpThenGraceful);
+    let alice = FailingNode::spawn(random(), vec![bob.args.node_info()], alice_sync_config).await;
+
+    let alice_handle = {
+        let manager_ref = call!(alice.sync_ref, ToSyncManager::Create, topic, true).unwrap();
+        SyncHandle::new(topic, alice.sync_ref.clone(), manager_ref)
+    };
+    let mut alice_subscription = alice_handle.subscribe().await.unwrap();
+
+    let _bob_handle = {
+        let manager_ref = call!(bob.sync_ref, ToSyncManager::Create, topic, true).unwrap();
+        SyncHandle::new(topic, bob.sync_ref.clone(), manager_ref)
+    };
+
+    let expected_remote = bob.node_id();
+
+    // First session: `CaughtUpThenGraceful` marks it caught up immediately, then ends on its own
+    // after ~200ms (matching `Graceful`'s timing) -- this harness's `ToSync::Close` is a no-op
+    // (`DummySyncManager::session_handle`'s dummy channel has no live receiver), so a *natural*
+    // end is what actually exercises "the old session terminates" here.
+    alice_handle.initiate_session(expected_remote);
+    let event = alice_subscription.next().await.unwrap();
+    assert!(
+        matches!(
+            event,
+            Ok(FromSync {
+                session_id: 0,
+                event: DummySyncEvent::SessionCreated,
+                ..
+            })
+        ),
+        "{event:#?}"
+    );
+    // `CaughtUpThenGraceful` also emits `SyncFinished` synchronously, right after
+    // `SessionCreated`, onto this same subscription -- consume it explicitly so it isn't mistaken
+    // for a second session's event later.
+    let event = alice_subscription.next().await.unwrap();
+    assert!(
+        matches!(
+            event,
+            Ok(FromSync {
+                session_id: 0,
+                event: DummySyncEvent::SyncFinished,
+                ..
+            })
+        ),
+        "{event:#?}"
+    );
+
+    // Let `TopicManager`'s own background catch-up tracking (a separate task reading the same
+    // broadcast channel) actually record this session's `SyncFinished` before resyncing.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    alice_handle.resync(expected_remote);
+
+    // Simulate gossip's `NeighbourDown` -> `EndSync` for bob landing before the old session's own
+    // ~200ms termination.
+    alice
+        .sync_ref
+        .send_message(ToSyncManager::EndSync(topic, expected_remote))
+        .unwrap();
+
+    // Give the old session plenty of time to actually terminate and confirm no second session is
+    // ever created.
+    let no_resurrection =
+        tokio::time::timeout(Duration::from_millis(800), alice_subscription.next()).await;
+    assert!(
+        no_resurrection.is_err(),
+        "a resync replacement must not resurrect a session for a peer that left the active sync \
+         set while the old session was closing, but got: {no_resurrection:?}"
+    );
+
+    alice.shutdown();
+    bob.shutdown();
+}
+
+/// square-tower fork addition (M4-16 review): a resync replacement's deferred re-`Initiate` must
+/// re-run `ConnectionAuthoriser::can_connect_on_topic` at the point it actually fires, not rely
+/// only on the check that ran (successfully) before the old session was asked to close.
+/// Mutation-proof: reverting `resume_pending_resync`'s authorisation re-check makes this test fail
+/// (a second session appears) -- both runs captured in the PR.
+#[tokio::test]
+async fn deferred_resync_respects_authoriser() {
+    setup_logging();
+
+    let topic = [6; 32].into();
+
+    let (bob_sync_config, _bob_rx) = FailingSyncArgs::new(SyncBehaviour::Graceful);
+    let mut bob = FailingNode::spawn(random(), vec![], bob_sync_config).await;
+
+    let (alice_sync_config, _alice_rx) = FailingSyncArgs::new(SyncBehaviour::CaughtUpThenGraceful);
+    let alice = FailingNode::spawn(random(), vec![bob.args.node_info()], alice_sync_config).await;
+
+    let alice_handle = {
+        let manager_ref = call!(alice.sync_ref, ToSyncManager::Create, topic, true).unwrap();
+        SyncHandle::new(topic, alice.sync_ref.clone(), manager_ref)
+    };
+    let mut alice_subscription = alice_handle.subscribe().await.unwrap();
+
+    let _bob_handle = {
+        let manager_ref = call!(bob.sync_ref, ToSyncManager::Create, topic, true).unwrap();
+        SyncHandle::new(topic, bob.sync_ref.clone(), manager_ref)
+    };
+
+    let expected_remote = bob.node_id();
+
+    alice_handle.initiate_session(expected_remote);
+    let event = alice_subscription.next().await.unwrap();
+    assert!(
+        matches!(
+            event,
+            Ok(FromSync {
+                session_id: 0,
+                event: DummySyncEvent::SessionCreated,
+                ..
+            })
+        ),
+        "{event:#?}"
+    );
+    // `CaughtUpThenGraceful` also emits `SyncFinished` synchronously, right after
+    // `SessionCreated`, onto this same subscription -- consume it explicitly so it isn't mistaken
+    // for a second session's event later.
+    let event = alice_subscription.next().await.unwrap();
+    assert!(
+        matches!(
+            event,
+            Ok(FromSync {
+                session_id: 0,
+                event: DummySyncEvent::SyncFinished,
+                ..
+            })
+        ),
+        "{event:#?}"
+    );
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    alice_handle.resync(expected_remote);
+
+    // Let the resync request's own (first) authorisation check -- run inside `ToSyncManager::
+    // Resync`'s handler, before `TopicManager::Resync` ever sets `pending_resync` -- actually
+    // complete while the authoriser is still permissive; otherwise blocking immediately below
+    // could race that first check instead of the deferred one this test targets.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Authorisation changes in the window between the resync request and the old session's actual
+    // (~200ms) termination.
+    alice.connection_authoriser.block(expected_remote).await;
+
+    let no_session =
+        tokio::time::timeout(Duration::from_millis(800), alice_subscription.next()).await;
+    assert!(
+        no_session.is_err(),
+        "a deferred resync replacement must not bypass a ConnectionAuthoriser block that took \
+         effect after the request but before the old session terminated, but got: {no_session:?}"
     );
 
     alice.shutdown();

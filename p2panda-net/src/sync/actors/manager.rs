@@ -351,6 +351,11 @@ where
                         state.sync_args.clone(),
                         from_sync_tx,
                         state.endpoint.clone(),
+                        // square-tower fork addition (D3-s, M4-16 review): so a deferred resync
+                        // replacement can re-run the same authorisation check at the point it
+                        // actually re-initiates, not just once, up front, before the old session
+                        // was asked to close.
+                        state.connection_authoriser.clone(),
                     ),
                     myself.clone().into(),
                     state.thread_pool.clone(),

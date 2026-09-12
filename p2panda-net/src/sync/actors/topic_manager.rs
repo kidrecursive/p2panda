@@ -27,6 +27,7 @@ use tokio::sync::{broadcast, oneshot};
 use tokio::time::Duration;
 use tracing::{debug, warn};
 
+use crate::connection_authoriser::{ConnectionAuthoriser, ConnectionAuthoriserEvent};
 use crate::iroh_endpoint::Endpoint;
 use crate::sync::actors::poller::{SyncPoller, ToSyncPoller};
 use crate::sync::actors::session::{SyncSession, SyncSessionId, SyncSessionMessage};
@@ -119,8 +120,19 @@ where
     /// part of an in-progress resync replacement, mapped to the `live_mode` the fresh session
     /// should use once the old one has actually terminated (`ActorTerminated`/`ActorFailed`). A
     /// second `Resync` for a node already in this map is a no-op (at most one replacement in
-    /// flight per (peer, topic) at a time).
+    /// flight per (peer, topic) at a time). Cleared without re-initiating if the node leaves
+    /// `active_sync_set` (gossip `NeighbourDown`/`EndSync`, or `Close`/`CloseAll`) before the old
+    /// session actually terminates -- see the M4-16 review fix in `handle_supervisor_evt` and the
+    /// `Close`/`CloseAll` handlers below.
     pending_resync: HashMap<NodeId, bool>,
+
+    /// square-tower fork addition (D3-s, M4-16 review): used to re-run the identical
+    /// `ConnectionAuthoriser` check `ToSyncManager::Resync`/`InitiateSync` already ran, at the
+    /// point a deferred resync replacement actually re-`Initiate`s (`handle_supervisor_evt`) --
+    /// that check ran once, before the old session was asked to close, and authorisation state can
+    /// change in the window between that check and the old session's actual termination. Cloned
+    /// from the same `ConnectionAuthoriser` the owning `SyncManager` holds (passed in at spawn).
+    connection_authoriser: ConnectionAuthoriser,
 }
 
 #[derive(Debug)]
@@ -150,6 +162,7 @@ where
         M::Args,
         broadcast::Sender<FromSync<M::Event>>,
         Endpoint,
+        ConnectionAuthoriser,
     );
 
     async fn pre_start(
@@ -157,7 +170,7 @@ where
         myself: ActorRef<Self::Msg>,
         args: Self::Arguments,
     ) -> Result<Self::State, ActorProcessingErr> {
-        let (protocol_id, topic, config, sender, endpoint) = args;
+        let (protocol_id, topic, config, sender, endpoint, connection_authoriser) = args;
         let pool = ThreadLocalActorSpawner::new();
 
         let mut manager = M::from_args(config);
@@ -209,6 +222,7 @@ where
             pool,
             session_catch_up,
             pending_resync: HashMap::new(),
+            connection_authoriser,
         })
     }
 
@@ -432,6 +446,18 @@ where
                     );
                 }
 
+                // square-tower fork addition (D3-s, M4-16 review): a pending resync replacement
+                // for any of these nodes must not resurrect a session once every session is being
+                // torn down.
+                if !state.pending_resync.is_empty() {
+                    debug!(
+                        topic = state.topic.fmt_short(),
+                        "cancelled {} pending resync(s) on CloseAll",
+                        state.pending_resync.len()
+                    );
+                    state.pending_resync.clear();
+                }
+
                 // The receiver may have been dropped immediately if the caller is not interested
                 // in awaiting the termination signal, so we ignore any potential error here.
                 let _ = reply.send(());
@@ -444,6 +470,20 @@ where
                         node_id.fmt_short()
                     );
                 };
+
+                // square-tower fork addition (D3-s, M4-16 review): this node is being closed
+                // (gossip `NeighbourDown` -> `EndSync`, or an explicit close) -- a resync
+                // replacement pending for it must not resurrect a session once its old one
+                // actually terminates. `handle_supervisor_evt`'s own `active_sync_set` gate is a
+                // second, independent line of defence for the same race; this one fires
+                // immediately, without waiting for termination.
+                if state.pending_resync.remove(&node_id).is_some() {
+                    debug!(
+                        remote_node_id = %node_id.fmt_short(),
+                        topic = state.topic.fmt_short(),
+                        "cancelled pending resync: node is being closed"
+                    );
+                }
 
                 let node_sessions = state.node_session_map.get(&node_id).cloned();
 
@@ -567,9 +607,13 @@ where
                         // session before `drop_session` clears the mapping, so a resync
                         // replacement pending on this exact session can be resumed now that the
                         // old session has actually terminated (not merely been asked to close).
-                        let owner = state.node_session_map.iter().find_map(|(node_id, sessions)| {
-                            sessions.contains(&session_id).then_some(*node_id)
-                        });
+                        let owner =
+                            state
+                                .node_session_map
+                                .iter()
+                                .find_map(|(node_id, sessions)| {
+                                    sessions.contains(&session_id).then_some(*node_id)
+                                });
 
                         Self::drop_session(state, session_id);
                         state
@@ -581,17 +625,14 @@ where
                         if let Some(node_id) = owner
                             && let Some(live_mode) = state.pending_resync.remove(&node_id)
                         {
-                            debug!(
-                                remote_node_id = %node_id.fmt_short(),
-                                topic = state.topic.fmt_short(),
-                                %live_mode,
-                                "resync: previous session terminated, starting fresh session"
-                            );
-                            let _ = myself.send_message(ToTopicManager::Initiate {
+                            Self::resume_pending_resync(
+                                &myself,
+                                state,
                                 node_id,
-                                topic: state.topic,
                                 live_mode,
-                            });
+                                "terminated",
+                            )
+                            .await;
                         }
                     }
                     None => {
@@ -652,17 +693,14 @@ where
                         // graceful path -- and skip the normal failure-retry timer, since we're
                         // already re-initiating immediately.
                         if let Some(live_mode) = state.pending_resync.remove(&remote_node_id) {
-                            debug!(
-                                remote_node_id = %remote_node_id.fmt_short(),
-                                topic = state.topic.fmt_short(),
-                                %live_mode,
-                                "resync: previous session failed while closing, starting fresh session"
-                            );
-                            let _ = myself.send_message(ToTopicManager::Initiate {
-                                node_id: remote_node_id,
-                                topic: state.topic,
+                            Self::resume_pending_resync(
+                                &myself,
+                                state,
+                                remote_node_id,
                                 live_mode,
-                            });
+                                "failed",
+                            )
+                            .await;
                             return Ok(());
                         }
 
@@ -748,6 +786,74 @@ where
         state.actor_session_id_map.insert(actor_id, session_id);
 
         (session_id, session)
+    }
+
+    /// square-tower fork addition (D3-s, M4-16 review): called once the old session of a pending
+    /// resync replacement has actually terminated (gracefully or by failure -- `reason` is only
+    /// for the log line). Only proceeds if `node_id` is still in `active_sync_set` (it may have
+    /// left via gossip `NeighbourDown`/`EndSync` or an explicit `Close`/`CloseAll` in the window
+    /// between the resync's `Close` and this termination -- those handlers also clear
+    /// `pending_resync` directly, but this is a second, independent gate against the same race)
+    /// and re-runs the identical `ConnectionAuthoriser` check the original `Resync`/`InitiateSync`
+    /// request ran -- authorisation state can change in that same window, and that first check is
+    /// stale by the time the fresh session would actually be created. No bypass: `Initiate` is
+    /// only sent after a fresh, successful `can_connect_on_topic`.
+    async fn resume_pending_resync(
+        myself: &ActorRef<ToTopicManager<M::Message>>,
+        state: &TopicManagerState<M>,
+        node_id: NodeId,
+        live_mode: bool,
+        reason: &'static str,
+    ) {
+        let topic = state.topic;
+
+        if !state.active_sync_set.contains(&node_id) {
+            debug!(
+                remote_node_id = %node_id.fmt_short(),
+                topic = %topic.fmt_short(),
+                "drop pending resync: peer no longer in active sync set"
+            );
+            return;
+        }
+
+        if state
+            .connection_authoriser
+            .can_connect_on_topic(node_id, topic)
+            .await
+        {
+            state
+                .connection_authoriser
+                .send_event(ConnectionAuthoriserEvent::TopicAllowed {
+                    topic,
+                    node: node_id,
+                })
+                .await;
+        } else {
+            let event = ConnectionAuthoriserEvent::TopicBlocked {
+                topic,
+                node: node_id,
+            };
+            warn!("{}", event);
+            state.connection_authoriser.send_event(event).await;
+            debug!(
+                remote_node_id = %node_id.fmt_short(),
+                topic = %topic.fmt_short(),
+                "drop pending resync: no longer authorised"
+            );
+            return;
+        }
+
+        debug!(
+            remote_node_id = %node_id.fmt_short(),
+            topic = %topic.fmt_short(),
+            %live_mode,
+            "resync: previous session {reason}, starting fresh session"
+        );
+        let _ = myself.send_message(ToTopicManager::Initiate {
+            node_id,
+            topic,
+            live_mode,
+        });
     }
 
     /// Remove a session from all manager state mappings.
