@@ -247,6 +247,24 @@ where
                                 // If the orderer returns a "pending" result we don't want to affect
                                 // any next processors anymore.
                                 if event.is_pending() {
+                                    // D3-l probe A: this branch is otherwise silent -- a
+                                    // permanently-pending event never surfaces anywhere else in the
+                                    // pipeline. Log which op parked and what it was waiting on so a
+                                    // stuck orderer chain is diagnosable from RUST_LOG=debug alone.
+                                    if let p2panda_stream::orderer::OrdererArgs::Process {
+                                        dependencies,
+                                    } = &event.orderer_args
+                                    {
+                                        tracing::debug!(
+                                            target: "p2panda::orderer",
+                                            op = %event.operation.hash.fmt_short(),
+                                            deps = ?dependencies
+                                                .iter()
+                                                .map(|dep| dep.fmt_short())
+                                                .collect::<Vec<_>>(),
+                                            "orderer pending"
+                                        );
+                                    }
                                     event.noop()
                                 } else {
                                     event

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use std::borrow::Borrow;
 use std::time::Duration;
 
 use p2panda_core::traits::{Provenance, ShortFormat};
@@ -198,6 +199,29 @@ pub(crate) async fn repair_space<M>(
     if spaces_messages.is_empty() && groups_operations.is_empty() {
         return Ok(false);
     }
+
+    // D3-l probe B: log the raw republish set and the forged pointers' auth_message_id set side
+    // by side so a mismatch (T1: a pointer forged for an auth op not in this batch's raws, and not
+    // yet in the space state either) is visible from RUST_LOG=debug without re-deriving it from
+    // the op_count parity alone.
+    debug!(
+        node_id = manager.id().fmt_short(),
+        space_id = space_id.fmt_short(),
+        raw = ?groups_operations
+            .iter()
+            .map(|op| op.hash.fmt_short())
+            .collect::<Vec<_>>(),
+        ptrs = ?spaces_messages
+            .iter()
+            .filter_map(|message| match message.borrow() {
+                SpacesArgs::SpaceMembership { auth_message_id, .. } => {
+                    Some(auth_message_id.fmt_short())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        "repair batch"
+    );
 
     // Send all resulting operations into the stream.
     let op_count = groups_operations.len() + spaces_messages.len();
