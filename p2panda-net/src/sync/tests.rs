@@ -102,6 +102,11 @@ enum SyncBehaviour {
     Panic,
     Error,
     Wait,
+    /// square-tower fork addition (D3-k): ends the session with `Ok(())` right away, mirroring
+    /// `TopicLogSync::run()` returning `Ok(())` after receiving (or sending) a `Close` message --
+    /// the "graceful end, no error" case `topic_manager.rs`'s `handle_supervisor_evt` never
+    /// retries (only `ActorFailed` does).
+    Graceful,
 }
 
 #[derive(Debug)]
@@ -130,6 +135,7 @@ impl Protocol for FailingSyncProtocol {
                 while let Some(_) = stream.next().await {}
                 return Err(SyncError::UnexpectedFailure);
             }
+            SyncBehaviour::Graceful => return Ok(()),
         }
     }
 }
@@ -295,4 +301,84 @@ async fn failed_sync_session_retry() {
         alice.shutdown();
         bob.shutdown();
     }
+}
+
+/// square-tower fork addition (D3-k, `docs/upstream/p2panda-manual-resync.md`): a session that
+/// ends *gracefully* (`Ok(())`, e.g. because gossip's HyParView active view dropped this peer and
+/// `GossipEvent::NeighbourDown` triggered `ToSyncManager::EndSync` -> a normal `Close`) is never
+/// automatically retried -- `handle_supervisor_evt`'s `ActorTerminated` arm only cleans up session
+/// state, it never schedules `ToTopicManager::Retry` the way `ActorFailed` does. Proves both
+/// halves: (1) the gap (no second `SessionCreated` shows up on its own) and (2) the fix (a manual
+/// `SyncHandle::initiate_session` call -- now available outside test builds -- creates a fresh
+/// session and recovers).
+#[tokio::test]
+async fn graceful_session_end_is_not_retried_but_manual_resync_recovers() {
+    setup_logging();
+
+    let topic = [1; 32].into();
+
+    let (bob_sync_config, _bob_rx) = FailingSyncArgs::new(SyncBehaviour::Graceful);
+    let mut bob = FailingNode::spawn(random(), vec![], bob_sync_config).await;
+
+    let (alice_sync_config, _alice_rx) = FailingSyncArgs::new(SyncBehaviour::Graceful);
+    let alice = FailingNode::spawn(random(), vec![bob.args.node_info()], alice_sync_config).await;
+
+    let alice_handle = {
+        let manager_ref = call!(alice.sync_ref, ToSyncManager::Create, topic, true).unwrap();
+        SyncHandle::new(topic, alice.sync_ref.clone(), manager_ref)
+    };
+    let mut alice_subscription = alice_handle.subscribe().await.unwrap();
+
+    let _bob_handle = {
+        let manager_ref = call!(bob.sync_ref, ToSyncManager::Create, topic, true).unwrap();
+        SyncHandle::new(topic, bob.sync_ref.clone(), manager_ref)
+    };
+
+    let expected_remote = bob.node_id();
+
+    // First session, initiated manually (mirrors the node's very first join).
+    alice_handle.initiate_session(expected_remote);
+    let event = alice_subscription.next().await.unwrap();
+    assert!(
+        matches!(
+            event,
+            Ok(FromSync {
+                session_id: 0,
+                remote,
+                event: DummySyncEvent::SessionCreated
+            }) if remote == expected_remote
+        ),
+        "{:#?}",
+        event
+    );
+
+    // The session ends gracefully (`SyncBehaviour::Graceful` returns `Ok(())`). Give it time to
+    // actually terminate and confirm no second `SessionCreated` appears on its own within a
+    // generous window -- this is the defect: `ActorTerminated` alone never retries.
+    let no_auto_retry = tokio::time::timeout(Duration::from_millis(800), alice_subscription.next())
+        .await;
+    assert!(
+        no_auto_retry.is_err(),
+        "a gracefully-ended session must not be retried automatically, but got: {no_auto_retry:?}"
+    );
+
+    // The fix: a manual resync (what the node-side periodic resync task now calls on an
+    // interval) creates a fresh session and recovers.
+    alice_handle.initiate_session(expected_remote);
+    let event = alice_subscription.next().await.unwrap();
+    assert!(
+        matches!(
+            event,
+            Ok(FromSync {
+                session_id: 1,
+                remote,
+                event: DummySyncEvent::SessionCreated
+            }) if remote == expected_remote
+        ),
+        "manual resync should start a fresh session: {:#?}",
+        event
+    );
+
+    alice.shutdown();
+    bob.shutdown();
 }

@@ -102,6 +102,15 @@ where
         self.inner.id()
     }
 
+    /// Manually (re-)starts a sync session with `node_id` for this space's topic.
+    ///
+    /// square-tower fork addition (`square-tower/main`, D3-k in the downstream project's
+    /// `decisions.md`); see `StreamPublisher::resync`'s doc comment for the mechanism this
+    /// recovers from. Upstream PR draft: `docs/upstream/p2panda-manual-resync.md`.
+    pub fn resync(&self, node_id: p2panda_net::NodeId) {
+        self.tx.resync(node_id);
+    }
+
     #[allow(clippy::result_large_err)]
     pub async fn publish(&self, message: M) -> Result<SpaceFuture, PublishSpaceError> {
         let members = self.actors().await?;

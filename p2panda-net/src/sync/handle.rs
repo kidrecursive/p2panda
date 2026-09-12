@@ -76,12 +76,19 @@ where
         self.topic
     }
 
-    /// Manually starts sync session with given node.
+    /// Manually starts a sync session with the given node.
     ///
     /// If there's no transport information for this node this action will fail.
-    // TODO: Consider making this public, for this we would need to decide if we want to receive
-    // the sync session events and status directly as a stream from the return type?
-    #[cfg(test)]
+    ///
+    /// square-tower fork addition (`square-tower/main`, D3-k in the downstream project's
+    /// `decisions.md`): made available outside test builds so applications can trigger a resync
+    /// on their own schedule, independent of gossip's HyParView active-view churn (which can
+    /// permanently end a topic's sync session with a still-reachable, still-allowed peer with no
+    /// automatic recovery -- `p2panda-net/src/sync/actors/topic_manager.rs`'s retry path only
+    /// fires on `ActorFailed`, never on a session that ended gracefully after `GossipEvent::
+    /// NeighbourDown`). Upstream PR draft: `docs/upstream/p2panda-manual-resync.md` in that
+    /// project's repo. This method's behavior is unchanged for existing (test) callers -- only
+    /// its visibility widened.
     pub fn initiate_session(&self, node_id: crate::NodeId) {
         self.manager_ref
             .send_message(ToSyncManager::InitiateSync(self.topic, node_id))

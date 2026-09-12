@@ -145,6 +145,22 @@ where
         self.topic
     }
 
+    /// Manually (re-)starts a sync session with `node_id` for this topic.
+    ///
+    /// square-tower fork addition (`square-tower/main`, D3-k in the downstream project's
+    /// `decisions.md`): a thin wrapper around `p2panda_net::sync::SyncHandle::initiate_session`.
+    /// Intended for a periodic, node-side "resync" task that recovers from a sync session that
+    /// ended gracefully (no error) and was therefore never automatically retried -- e.g. gossip's
+    /// HyParView active-view churn dropping an already-admitted, still-reachable, still-allowed
+    /// peer (`GossipEvent::NeighbourDown` -> `ToSyncManager::EndSync`), which
+    /// `p2panda-net/src/sync/actors/topic_manager.rs`'s own retry path (`ActorFailed` only) never
+    /// undoes on its own. Upstream PR draft: `docs/upstream/p2panda-manual-resync.md`. If there is
+    /// no transport information for `node_id` this is a silent no-op (mirrors `SyncHandle::
+    /// initiate_session`'s own documented behavior).
+    pub fn resync(&self, node_id: p2panda_net::NodeId) {
+        self.sync_handle.initiate_session(node_id);
+    }
+
     /// Publish a message into a topic stream.
     ///
     /// Locally created operations are processed by the same pipeline as remotely received
