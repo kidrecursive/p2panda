@@ -36,6 +36,13 @@ use crate::{NodeId, ProtocolId};
 
 const RETRY_RATE: Duration = Duration::from_secs(5);
 
+/// square-tower fork addition (D3-u fix, M4-21): delay before the surviving side of a
+/// resync-driven close re-`Initiate`s on its own (see that send site's doc comment) -- long
+/// enough to give the closing side's own `resume_pending_resync` a head start in the common case
+/// (both sides reachable), short enough that total recovery still lands well under
+/// `sync.resync_interval`'s 30s timer fallback.
+const SURVIVOR_REINITIATE_DELAY: Duration = Duration::from_millis(750);
+
 /// square-tower fork addition (D3-u fix, M4-21): quiet gap used to coalesce a burst of
 /// associations for the same topic into a single `AssociationChanged` (see its send site's doc
 /// comment). Short enough that recovery from a genuinely isolated association is still much
@@ -282,7 +289,8 @@ where
                     // window, coalescing the whole burst into the one notification below.
                     while let Ok(Some(())) =
                         tokio::time::timeout(ASSOCIATION_DEBOUNCE, new_associations.next()).await
-                    {}
+                    {
+                    }
                     if myself
                         .send_message(ToTopicManager::AssociationChanged)
                         .is_err()
@@ -756,29 +764,81 @@ where
                                 });
 
                         Self::drop_session(state, session_id);
-                        state
+                        let was_caught_up = state
                             .session_catch_up
                             .lock()
                             .expect("session_catch_up mutex poisoned")
-                            .remove(&session_id);
+                            .remove(&session_id)
+                            .unwrap_or(false);
                         state
                             .session_logs
                             .lock()
                             .expect("session_logs mutex poisoned")
                             .remove(&session_id);
 
-                        if let Some(node_id) = owner
-                            && let Some(live_mode) =
+                        if let Some(node_id) = owner {
+                            if let Some(live_mode) =
                                 Self::record_pending_resync_termination(state, node_id, session_id)
-                        {
-                            Self::resume_pending_resync(
-                                &myself,
-                                state,
-                                node_id,
-                                live_mode,
-                                "terminated",
-                            )
-                            .await;
+                            {
+                                Self::resume_pending_resync(
+                                    &myself,
+                                    state,
+                                    node_id,
+                                    live_mode,
+                                    "terminated",
+                                )
+                                .await;
+                            } else if was_caught_up && state.active_sync_set.contains(&node_id) {
+                                // square-tower fork addition (D3-u fix, M4-21): this session had
+                                // already reached "caught up" (eligible for resync-driven
+                                // replacement) and then ended gracefully for a reason OTHER than
+                                // OUR OWN resync decision -- most notably, the REMOTE side's own
+                                // resync closing the session it initiated with us (D3-u's
+                                // association fires on whichever side actually holds the changed
+                                // association, so a resync-driven close can land on either side of
+                                // a session; only the closing side's own `pending_resync` triggers
+                                // the branch above). D3-k's original gap ("a session that ends
+                                // gracefully is never retried automatically") reopens here for the
+                                // surviving side, which would otherwise wait for gossip churn or
+                                // the 30s timer. Gated on `was_caught_up` specifically (not just
+                                // "any graceful end") so this does not touch D3-k's own,
+                                // deliberately-still-30s-only case of a session that never even
+                                // reached caught-up before ending on its own
+                                // (`graceful_session_end_is_not_retried_but_manual_resync_recovers`,
+                                // unaffected -- unmodified, still passes). Re-`Initiate`
+                                // immediately if the peer is still wanted; `Initiate`'s own dedupe
+                                // (skip if another session already exists) makes this a no-op if
+                                // one does.
+                                // Delayed, not immediate: gives the CLOSING side's own
+                                // `resume_pending_resync` (near-instant once its old session
+                                // actor confirms termination) a head start, so the common case
+                                // (both sides reachable) resolves via that single path instead of
+                                // a race between two independent `Initiate`s for the same peer
+                                // (`Initiate`'s dedupe check and the new session actually
+                                // registering are not atomic -- two near-simultaneous `Initiate`s
+                                // can both pass it, briefly producing two sessions; caught by this
+                                // fix's own `association_burst_coalesces_into_one_replacement`
+                                // test before this delay was added). Only fires for real once
+                                // `SURVIVOR_REINITIATE_DELAY` has passed with no session having
+                                // reappeared (`Initiate`'s dedupe is re-checked at that point).
+                                info!(
+                                    node_id = %state.endpoint.node_id().fmt_short(),
+                                    remote_node_id = %node_id.fmt_short(),
+                                    topic = %state.topic.fmt_short(),
+                                    "sync session terminated gracefully by remote: \
+                                     re-initiating if it doesn't reappear on its own"
+                                );
+                                let topic = state.topic;
+                                let _ = myself
+                                    .send_after(SURVIVOR_REINITIATE_DELAY, move || {
+                                        ToTopicManager::Initiate {
+                                            node_id,
+                                            topic,
+                                            live_mode: true,
+                                        }
+                                    })
+                                    .await;
+                            }
                         }
                     }
                     None => {
