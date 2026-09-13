@@ -20,7 +20,7 @@ use pin_project_lite::pin_project;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::broadcast;
-use tracing::{Level, debug, enabled, trace, warn};
+use tracing::{Level, debug, enabled, info, trace, warn};
 
 use crate::ToSync;
 use crate::dedup::DEFAULT_BUFFER_CAPACITY;
@@ -198,6 +198,11 @@ where
                 // messages and also check they are part of our topic sub-set selection before forwarding
                 // them on the event stream, or to the remote peer.
                 let mut close_sent = false;
+                info!(
+                    sent_ops = %metrics.sent_operations(),
+                    received_ops = %metrics.received_operations(),
+                    "sync session live"
+                );
                 self.event_tx
                     .send(TopicLogSyncEvent::LiveModeStarted)
                     .map_err(|_| TopicLogSyncChannelError::EventSend)?;
@@ -244,7 +249,7 @@ where
                                     // We send the close and wait for the remote to close the
                                     // connection.
 
-                                    debug!("closing sync session");
+                                    info!("closing sync session");
                                     let result = sink
                                         .send(TopicLogSyncMessage::Close)
                                         .await
@@ -269,7 +274,7 @@ where
                                     if let TopicLogSyncMessage::Close = message {
                                         // We received the remotes close message and should close the
                                         // connection ourselves.
-                                        debug!("received close message from remote");
+                                        info!("received close message from remote");
                                         break Ok(());
                                     };
 

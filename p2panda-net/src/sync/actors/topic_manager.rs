@@ -25,7 +25,7 @@ use ractor::thread_local::{ThreadLocalActor, ThreadLocalActorSpawner};
 use ractor::{ActorId, ActorProcessingErr, ActorRef, SupervisionEvent};
 use tokio::sync::{broadcast, oneshot};
 use tokio::time::Duration;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::connection_authoriser::{ConnectionAuthoriser, ConnectionAuthoriserEvent};
 use crate::iroh_endpoint::Endpoint;
@@ -317,7 +317,7 @@ where
             ToTopicManager::Retry { node_id, live_mode } => {
                 // If this node was removed from the active sync set we skip retrying.
                 if !state.active_sync_set.contains(&node_id) {
-                    debug!(
+                    info!(
                         remote = %node_id.fmt_short(),
                         topic = %state.topic.fmt_short(),
                         %live_mode,
@@ -515,7 +515,7 @@ where
                 live_mode,
             } => {
                 if state.pending_resync.contains_key(&node_id) {
-                    debug!(
+                    info!(
                         node_id = %state.endpoint.node_id().fmt_short(),
                         remote_node_id = %node_id.fmt_short(),
                         topic = %topic.fmt_short(),
@@ -531,7 +531,7 @@ where
                     .unwrap_or_default();
 
                 if current_sessions.is_empty() {
-                    debug!(
+                    info!(
                         node_id = %state.endpoint.node_id().fmt_short(),
                         remote_node_id = %node_id.fmt_short(),
                         topic = %topic.fmt_short(),
@@ -557,7 +557,7 @@ where
                 };
 
                 if catch_up_in_progress {
-                    debug!(
+                    info!(
                         node_id = %state.endpoint.node_id().fmt_short(),
                         remote_node_id = %node_id.fmt_short(),
                         topic = %topic.fmt_short(),
@@ -566,7 +566,7 @@ where
                     return Ok(());
                 }
 
-                debug!(
+                info!(
                     node_id = %state.endpoint.node_id().fmt_short(),
                     remote_node_id = %node_id.fmt_short(),
                     topic = %topic.fmt_short(),
@@ -597,7 +597,7 @@ where
             SupervisionEvent::ActorTerminated(actor_cell, _, _) => {
                 match state.actor_session_id_map.remove(&actor_cell.get_id()) {
                     Some(session_id) => {
-                        debug!(
+                        info!(
                             %session_id,
                             topic = state.topic.fmt_short(),
                             "sync session terminated"
@@ -706,7 +706,7 @@ where
 
                         // If this node was removed from the active sync set we skip retrying.
                         if !state.active_sync_set.contains(&remote_node_id) {
-                            debug!(
+                            info!(
                                 remote = remote_node_id.fmt_short(),
                                 topic = state.topic.fmt_short(),
                                 "skip re-initiate sync: node no longer in active set"
@@ -808,7 +808,7 @@ where
         let topic = state.topic;
 
         if !state.active_sync_set.contains(&node_id) {
-            debug!(
+            info!(
                 remote_node_id = %node_id.fmt_short(),
                 topic = %topic.fmt_short(),
                 "drop pending resync: peer no longer in active sync set"
@@ -835,7 +835,7 @@ where
             };
             warn!("{}", event);
             state.connection_authoriser.send_event(event).await;
-            debug!(
+            info!(
                 remote_node_id = %node_id.fmt_short(),
                 topic = %topic.fmt_short(),
                 "drop pending resync: no longer authorised"
@@ -843,7 +843,7 @@ where
             return;
         }
 
-        debug!(
+        info!(
             remote_node_id = %node_id.fmt_short(),
             topic = %topic.fmt_short(),
             %live_mode,
