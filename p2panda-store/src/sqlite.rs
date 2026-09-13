@@ -7,10 +7,39 @@ use std::time::Duration;
 use p2panda_core::cbor::EncodeError;
 use sqlx::migrate::{MigrateDatabase, Migrator};
 use sqlx::sqlite::SqlitePoolOptions;
-use sqlx::{Sqlite, migrate};
+use sqlx::{Executor, Sqlite, migrate};
 use thiserror::Error;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, broadcast};
 use tracing::{error, warn};
+
+/// square-tower fork addition (M4-22): journal mode applied to every pool connection on open.
+///
+/// WAL lets readers (`SqliteStore::execute`, which does not go through the writer-serialising
+/// `semaphore` in `Transaction::begin`) proceed concurrently with a writer holding an open
+/// transaction, instead of contending for the single rollback-journal file. This is the leading
+/// candidate for the `(code: 5) database is locked` errors that silently dropped ingest writes
+/// (see `docs/upstream/p2panda-ingest-drop-recovery.md`).
+const SQLITE_JOURNAL_MODE_PRAGMA: &str = "PRAGMA journal_mode=wal;";
+
+/// square-tower fork addition (M4-22): busy timeout (milliseconds) applied to every pool
+/// connection on open.
+///
+/// Belt-and-braces alongside WAL: if a connection still finds the database locked (e.g. during
+/// a checkpoint), SQLite retries internally for up to this long before returning
+/// `SQLITE_BUSY`/`database is locked`, instead of failing immediately.
+const SQLITE_BUSY_TIMEOUT_PRAGMA: &str = "PRAGMA busy_timeout=5000;";
+
+/// Applies the fork's `PRAGMA journal_mode` / `PRAGMA busy_timeout` to every connection opened by
+/// the pool (M4-22).
+fn with_pragmas(options: SqlitePoolOptions) -> SqlitePoolOptions {
+    options.after_connect(|conn, _meta| {
+        Box::pin(async move {
+            conn.execute(SQLITE_JOURNAL_MODE_PRAGMA).await?;
+            conn.execute(SQLITE_BUSY_TIMEOUT_PRAGMA).await?;
+            Ok(())
+        })
+    })
+}
 
 /// Creates the SQLite database if it doesn't already exist.
 pub async fn create_database(url: &str) -> Result<(), SqliteError> {
@@ -33,8 +62,7 @@ pub async fn connection_pool(
     url: &str,
     max_connections: u32,
 ) -> Result<sqlx::SqlitePool, SqliteError> {
-    let pool: sqlx::SqlitePool = SqlitePoolOptions::new()
-        .max_connections(max_connections)
+    let pool: sqlx::SqlitePool = with_pragmas(SqlitePoolOptions::new().max_connections(max_connections))
         .connect(url)
         .await?;
     Ok(pool)
@@ -171,13 +199,15 @@ impl SqliteStoreBuilder {
             create_database(&self.url).await?;
         }
 
-        let pool: sqlx::SqlitePool = SqlitePoolOptions::new()
-            .min_connections(self.min_connections)
-            .max_connections(self.max_connections)
-            .idle_timeout(self.idle_timeout)
-            .max_lifetime(self.max_lifetime)
-            .connect(&self.url)
-            .await?;
+        let pool: sqlx::SqlitePool = with_pragmas(
+            SqlitePoolOptions::new()
+                .min_connections(self.min_connections)
+                .max_connections(self.max_connections)
+                .idle_timeout(self.idle_timeout)
+                .max_lifetime(self.max_lifetime),
+        )
+        .connect(&self.url)
+        .await?;
 
         if self.run_migrations {
             run_pending_migrations(&pool).await?;
@@ -519,10 +549,11 @@ pub enum DecodeError {
 #[cfg(test)]
 mod tests {
     use futures_test::task::noop_context;
+    use sqlx::sqlite::SqlitePoolOptions;
     use sqlx::{Executor, query, query_as, query_scalar};
     use tokio::pin;
 
-    use crate::sqlite::{SqliteError, SqliteStore};
+    use crate::sqlite::{SqliteError, SqliteStore, connection_pool};
     use crate::traits::Transaction;
 
     #[tokio::test]
@@ -767,4 +798,165 @@ mod tests {
         // Make sure we give pool 2 the time it needs to finish.
         handle.await.unwrap();
     }
+
+    /// Builds a file-backed pool so multiple real connections can contend for the same database
+    /// (unlike `SqliteStore::temporary()`, which is a single-connection `:memory:` database and
+    /// can never observe cross-connection locking).
+    fn temp_db_url(label: &str) -> String {
+        let path = std::env::temp_dir().join(format!(
+            "p2panda-store-m4-22-{label}-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        format!("sqlite://{}?mode=rwc", path.display())
+    }
+
+    fn is_locked_error(err: &sqlx::Error) -> bool {
+        let msg = err.to_string();
+        msg.contains("database is locked") || msg.contains("SQLITE_BUSY")
+    }
+
+    /// Opens a second, independent connection straight from the pool (modelling a concurrent
+    /// process/connection, the way `p2panda-net`'s status queries and a second node's writes
+    /// really are independent connections) and starts -- but never releases -- a read
+    /// transaction on it, then runs `writes` concurrent single-row insert-and-commit cycles
+    /// through the given `SqliteStore`'s own API (begin/tx/commit, `SqliteStore::execute`'s
+    /// sibling write path) while that reader transaction stays open throughout. Returns the
+    /// number of writes (of `writes`) that surfaced a "database is locked" / `SQLITE_BUSY` error.
+    ///
+    /// Under a rollback-journal (`DELETE`) database, a writer's `COMMIT` can be blocked by any
+    /// connection still holding an open read transaction (needs to briefly upgrade to an
+    /// exclusive lock); under WAL, readers and writers never block each other, so every write
+    /// here must still succeed with the reader open the whole time.
+    async fn writes_under_open_reader(
+        pool: &sqlx::SqlitePool,
+        store: &SqliteStore,
+        writes: usize,
+    ) -> usize {
+        let mut reader_tx = pool.begin().await.expect("reader transaction begins");
+        let _held: i64 = query_scalar("SELECT COUNT(*) FROM test")
+            .fetch_one(&mut *reader_tx)
+            .await
+            .expect("reader transaction reads");
+
+        let mut lock_errors = 0;
+        for i in 0..writes {
+            let permit = store.begin().await.expect("writer begins");
+            let insert = store
+                .tx(async |tx| {
+                    query("INSERT INTO test (x) VALUES (?)")
+                        .bind(i as i64)
+                        .execute(&mut **tx)
+                        .await
+                        .map_err(SqliteError::Sqlite)
+                })
+                .await;
+            let commit = match insert {
+                Ok(_) => store.commit(permit).await,
+                Err(_) => {
+                    store.rollback(permit).await.expect("rollback succeeds");
+                    insert.map(|_| ())
+                }
+            };
+            if let Err(SqliteError::Sqlite(err)) = &commit
+                && is_locked_error(err)
+            {
+                lock_errors += 1;
+                // Deterministic once the reader is held open: every subsequent write will hit
+                // the exact same lock, so stop early instead of paying out `writes` more
+                // `busy_timeout` waits for no new information.
+                break;
+            }
+        }
+
+        // Release the held-open reader last, so its lifetime spans the whole loop above.
+        reader_tx.rollback().await.expect("reader transaction ends");
+        lock_errors
+    }
+
+    /// M4-22: with the fork's `PRAGMA journal_mode=wal` / `PRAGMA busy_timeout` applied to every
+    /// pool connection (`with_pragmas`, used by both `connection_pool` and
+    /// `SqliteStoreBuilder::build`), a writer must be able to commit while a second connection
+    /// holds an open read transaction on the same database, without surfacing
+    /// `database is locked` / `SQLITE_BUSY` -- this was silently dropping ingest writes (see
+    /// `docs/upstream/p2panda-ingest-drop-recovery.md`).
+    ///
+    /// Exercises `connection_pool` rather than `SqliteStoreBuilder::build` deliberately: `build`
+    /// creates the database through sqlx's own `Sqlite::create_database`, which (as of sqlx
+    /// 0.9.0) *already* defaults new databases to WAL via its internal, explicitly
+    /// "UNSTABLE: for use by sqlx-cli only" `CREATE_DB_WAL` flag -- so a `build`-based test can't
+    /// tell our explicit pragma apart from that undocumented upstream default. `connection_pool`
+    /// never goes through `create_database`/migrations at all, so it has no such accidental WAL
+    /// mode and genuinely depends on `with_pragmas`; this is exactly the gap this fix closes
+    /// (`connection_pool` is public API, used whenever a caller wants a pool without the
+    /// `SqliteStoreBuilder` machinery) and it doubles as the harness that can prove the fix does
+    /// something even though `SqliteStoreBuilder::build`'s own default WAL-ness is currently a
+    /// happy accident of an unstable upstream internal, not a guarantee this fork should rely on.
+    ///
+    /// Mutation-proof: reverting the fix (removing the `with_pragmas` call in `connection_pool`,
+    /// i.e. falling back to a plain rollback-journal database) makes the "fixed" pool behave
+    /// exactly like the `control_pool` built explicitly without WAL below, which is asserted to
+    /// hit at least one lock error over the same 200 writes -- proving the harness itself can
+    /// fail before trusting its "fixed" assertion.
+    #[tokio::test]
+    async fn concurrent_access_does_not_lock_with_pragmas() {
+        const WRITES: usize = 200;
+
+        // Control: explicitly no WAL (matches the on-disk journal mode of the code before this
+        // fix) -- must observe at least one lock error, proving this harness can fail.
+        let control_pool = SqlitePoolOptions::new()
+            .max_connections(4)
+            .after_connect(|conn, _meta| {
+                Box::pin(async move {
+                    conn.execute("PRAGMA journal_mode=DELETE;").await?;
+                    // Fails fast instead of waiting out sqlx's own 5s default busy_timeout on
+                    // every one of the 200 writes below -- the reader never releases its lock
+                    // regardless, so the outcome is the same either way, just much slower.
+                    conn.execute("PRAGMA busy_timeout=0;").await?;
+                    Ok(())
+                })
+            })
+            .connect(&temp_db_url("control"))
+            .await
+            .unwrap();
+        let control_store = SqliteStore::from_pool(control_pool.clone());
+        control_store
+            .execute(async |pool| {
+                pool.execute("CREATE TABLE test(x INTEGER)").await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let control_lock_errors =
+            writes_under_open_reader(&control_pool, &control_store, WRITES).await;
+        assert!(
+            control_lock_errors > 0,
+            "control (rollback-journal, no WAL) is expected to observe at least one lock error \
+             while a reader transaction stays open across {WRITES} writer commits -- if it \
+             never does, this harness can't prove the fix does anything"
+        );
+
+        // Fixed: goes through the real `connection_pool` helper, i.e. production code path.
+        let fixed_pool = connection_pool(&temp_db_url("fixed"), 4).await.unwrap();
+        let fixed_store = SqliteStore::from_pool(fixed_pool.clone());
+        fixed_store
+            .execute(async |pool| {
+                pool.execute("CREATE TABLE test(x INTEGER)").await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let fixed_lock_errors =
+            writes_under_open_reader(&fixed_pool, &fixed_store, WRITES).await;
+        assert_eq!(
+            fixed_lock_errors, 0,
+            "PRAGMA journal_mode=wal must let writes commit while a reader transaction stays \
+             open (control observed {control_lock_errors} lock errors over the same {WRITES} \
+             writes)"
+        );
+    }
 }
+
