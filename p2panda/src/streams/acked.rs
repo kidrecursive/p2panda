@@ -18,6 +18,27 @@ use crate::streams::StreamFrom;
 
 pub type Logs = BTreeMap<VerifyingKey, Vec<LogId>>;
 
+/// square-tower fork addition (M4-22 fix round): number of attempts `Acked::ack` makes for the
+/// whole fetch-cursor->advance->persist span before surfacing a transient store error. 1 initial
+/// attempt + 3 retries. Mirrors `p2panda-stream::ingest::operation::INGEST_RETRY_ATTEMPTS`.
+const ACK_RETRY_ATTEMPTS: usize = 4;
+
+/// Backoff before each retry (index 0 is the delay before the *first* retry).
+const ACK_RETRY_BACKOFF: [std::time::Duration; ACK_RETRY_ATTEMPTS - 1] = [
+    std::time::Duration::from_millis(10),
+    std::time::Duration::from_millis(50),
+    std::time::Duration::from_millis(250),
+];
+
+/// Whether a store error is transient (SQLite connection briefly contended --
+/// `SQLITE_BUSY`/"database is locked") and therefore worth retrying the whole ack span for, as
+/// opposed to a structural/critical failure that should surface immediately. Mirrors
+/// `p2panda-stream::ingest::operation::is_transient_store_error`.
+fn is_transient_store_error(err: &SqliteError) -> bool {
+    let message = err.to_string();
+    message.contains("database is locked") || message.contains("SQLITE_BUSY")
+}
+
 /// Tracks a named cursor for a given topic and persists it in the store.
 #[derive(Clone, Debug)]
 pub struct Acked {
@@ -114,11 +135,48 @@ impl Acked {
     }
 
     /// Advance internal cursor by acking an operation.
+    ///
+    /// square-tower fork addition (M4-22 fix round): retries the whole
+    /// fetch-cursor->advance->persist span up to `ACK_RETRY_ATTEMPTS` times (10/50/250ms backoff)
+    /// on a transient store error (`SQLITE_BUSY`/"database is locked") before surfacing
+    /// `AckedError::Store`. Without this, a single transient error here surfaced as
+    /// `StreamEvent::AckFailed` instead of `Processed` (`p2panda/src/streams/stream.rs`) even
+    /// though the operation itself was already durably ingested and stored -- the node's own
+    /// consumers (`crates/node/src/topics.rs`) never counted the op or advanced its recorded
+    /// height on `AckFailed`, matching the CI-only `retention.rs::peer_never_prunes_remote_log`
+    /// failure signature (received_ops behind remote_height). Mirrors the same transient-error
+    /// classifier as `p2panda-stream::ingest::operation::is_transient_store_error`.
     pub async fn ack(&self, header: impl Borrow<Header>) -> Result<(), AckedError> {
         let _permit = self.semaphore.acquire().await;
 
         let header = header.borrow();
 
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match self.ack_attempt(header).await {
+                Err(AckedError::Store(err)) if is_transient_store_error(&err) => {
+                    if attempt >= ACK_RETRY_ATTEMPTS {
+                        return Err(AckedError::Store(err));
+                    }
+                    let backoff = ACK_RETRY_BACKOFF[attempt - 1];
+                    tracing::warn!(
+                        verifying_key = %header.verifying_key,
+                        seq_num = %header.seq_num,
+                        attempt,
+                        max_attempts = ACK_RETRY_ATTEMPTS,
+                        backoff_ms = backoff.as_millis(),
+                        error = %err,
+                        "ack hit a transient store error, retrying",
+                    );
+                    tokio::time::sleep(backoff).await;
+                }
+                other => return other,
+            }
+        }
+    }
+
+    async fn ack_attempt(&self, header: &Header) -> Result<(), AckedError> {
         let mut cursor = self.cursor().await?;
         cursor.advance(
             header.verifying_key,
@@ -195,7 +253,7 @@ mod tests {
     use crate::operation::{Extensions, LogId};
     use crate::streams::StreamFrom;
 
-    use super::Acked;
+    use super::{Acked, AckedError};
 
     #[tokio::test]
     async fn nacked_log_ranges() {
@@ -351,6 +409,140 @@ mod tests {
                 .get(&log_id)
                 .unwrap(),
             &(None, Some(0)),
+        );
+    }
+
+    /// M4-22 fix round: a file-backed pool, explicitly without WAL and with `busy_timeout=0`, so a
+    /// held-open reader transaction on a second connection deterministically (no timing race)
+    /// makes the very next writer commit fail with `database is locked` -- exactly the transient
+    /// error class `Acked::ack`'s retry is meant to survive. `Acked::new` accepts any
+    /// `SqliteStore`, including one built this way, so this doesn't need `Acked` itself to be
+    /// generic over a fault-injecting store type.
+    async fn faulty_store() -> (SqliteStore, sqlx::SqlitePool) {
+        let path = std::env::temp_dir().join(format!(
+            "p2panda-acked-m4-22-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(4)
+            .after_connect(|conn, _meta| {
+                Box::pin(async move {
+                    use sqlx::Executor;
+                    conn.execute("PRAGMA journal_mode=DELETE;").await?;
+                    conn.execute("PRAGMA busy_timeout=0;").await?;
+                    Ok(())
+                })
+            })
+            .connect(&url)
+            .await
+            .unwrap();
+        let store = SqliteStore::from_pool(pool.clone());
+        p2panda_store::sqlite::run_pending_migrations(&pool)
+            .await
+            .unwrap();
+        (store, pool)
+    }
+
+    /// A single transient store error on `ack` must be retried into success, not surfaced --
+    /// upstream (`p2panda/src/streams/stream.rs`) maps an `ack` error into `StreamEvent::AckFailed`
+    /// instead of `Processed`, even though the operation itself is already durably stored; the
+    /// node's consumers never count/height-track an `AckFailed` op (the CI-only
+    /// `retention.rs::peer_never_prunes_remote_log` failure signature).
+    #[tokio::test]
+    async fn ack_retries_single_transient_failure() {
+        let topic = Topic::random();
+        let (store, pool) = faulty_store().await;
+        let credentials = Credentials::generate();
+        let forge = OperationForge::new(credentials, store.clone());
+        let log_id = LogId::from_topic(topic);
+        let acked = Acked::new(store.clone(), topic);
+
+        let operation_0 = forge
+            .create_operation(
+                Some(topic),
+                log_id,
+                Some(b"la".to_vec()),
+                Extensions::from_topic(topic),
+            )
+            .await
+            .unwrap();
+
+        // Hold a reader transaction open on a second connection from the same pool -- the next
+        // writer commit (inside `ack`) is guaranteed to hit `database is locked` immediately
+        // (`busy_timeout=0`).
+        let mut reader_tx = pool.begin().await.unwrap();
+        sqlx::query("SELECT COUNT(*) FROM cursors_v1")
+            .fetch_optional(&mut *reader_tx)
+            .await
+            .unwrap();
+
+        // Release the reader partway through `ack`'s retry backoff budget (10 + 50 + 250 = 310ms
+        // worst case) -- comfortably between the 2nd (t=10ms) and 3rd (t=60ms) attempts, so the
+        // 3rd attempt succeeds.
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            reader_tx.rollback().await.unwrap();
+        });
+
+        let result = acked.ack(operation_0).await;
+        release.await.unwrap();
+
+        assert!(
+            result.is_ok(),
+            "a transient lock released mid-retry must recover, got {result:?}"
+        );
+        assert!(
+            acked
+                .nacked_log_ranges(StreamFrom::Frontier)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the ack must actually be persisted once the retry recovers"
+        );
+    }
+
+    /// Mutation: calling the un-retried `ack_attempt` directly (bypassing `ack`'s retry loop, i.e.
+    /// today's pre-fix behaviour) against the identical held-open-reader fault must surface the
+    /// store error -- proving `ack_retries_single_transient_failure` is actually sensitive to the
+    /// retry loop's presence.
+    #[tokio::test]
+    async fn without_retry_ack_attempt_surfaces_the_transient_error() {
+        let topic = Topic::random();
+        let (store, pool) = faulty_store().await;
+        let credentials = Credentials::generate();
+        let forge = OperationForge::new(credentials, store.clone());
+        let log_id = LogId::from_topic(topic);
+        let acked = Acked::new(store.clone(), topic);
+
+        let operation_0 = forge
+            .create_operation(
+                Some(topic),
+                log_id,
+                Some(b"la".to_vec()),
+                Extensions::from_topic(topic),
+            )
+            .await
+            .unwrap();
+
+        let mut reader_tx = pool.begin().await.unwrap();
+        sqlx::query("SELECT COUNT(*) FROM cursors_v1")
+            .fetch_optional(&mut *reader_tx)
+            .await
+            .unwrap();
+
+        let header: &crate::operation::Header = std::borrow::Borrow::borrow(&operation_0);
+        let result = acked.ack_attempt(header).await;
+        reader_tx.rollback().await.unwrap();
+
+        assert!(
+            matches!(result, Err(AckedError::Store(_))),
+            "without the retry loop, a single transient failure must surface as a store error \
+             (today's pre-fix behaviour, mapped to StreamEvent::AckFailed upstream), got {result:?}"
         );
     }
 }

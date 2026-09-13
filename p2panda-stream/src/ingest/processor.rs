@@ -434,54 +434,18 @@ mod tests {
             .await;
     }
 
-    /// Minimal `tracing::Subscriber` that only counts INFO-level events on a given target --
-    /// enough to assert the M4-22 known-gap park log-once behaviour without pulling in a test
-    /// framework crate.
-    struct CountingSubscriber {
-        target: &'static str,
-        count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    }
-
-    impl tracing::Subscriber for CountingSubscriber {
-        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-            metadata.target() == self.target
-        }
-
-        // Without this, tracing's global per-callsite `Interest` cache (shared process-wide,
-        // across every `tracing::subscriber::set_default` guard) can permanently cache "never
-        // interested" for this callsite the first time it's ever hit with no subscriber
-        // installed -- silently dropping every event under this thread-local subscriber too.
-        // Returning `sometimes()` forces `enabled()` to be re-checked on every event instead.
-        fn register_callsite(
-            &self,
-            _metadata: &'static tracing::Metadata<'static>,
-        ) -> tracing::subscriber::Interest {
-            tracing::subscriber::Interest::sometimes()
-        }
-
-        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-            tracing::span::Id::from_u64(1)
-        }
-
-        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
-
-        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
-
-        fn event(&self, event: &tracing::Event<'_>) {
-            if event.metadata().target() == self.target
-                && *event.metadata().level() == tracing::Level::INFO
-            {
-                self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            }
-        }
-
-        fn enter(&self, _span: &tracing::span::Id) {}
-        fn exit(&self, _span: &tracing::span::Id) {}
-    }
-
-    /// M4-22: the known-gap park case (`OutOfOrder { no_predecessor: false }`) must log exactly
-    /// once per (author, log_id) while parked, then log again if a *later, separate* stall hits
-    /// the same log after it released -- not once per park, and not silenced forever.
+    /// M4-22: the known-gap park case (`OutOfOrder { no_predecessor: false }`) must mark
+    /// `(author, log_id)` exactly once while parked (the internal state that gates the one-time
+    /// `info!` line), then mark it again if a *later, separate* stall hits the same log after it
+    /// released -- not once per park, and not silenced forever.
+    ///
+    /// Asserts directly on `Ingest::known_gap_park_logged` (visible here: `mod tests` is a
+    /// descendant module of the one that defines it) rather than intercepting the `tracing`
+    /// output -- a `tracing::Subscriber`-based version of this test was flaky under `cargo
+    /// test`'s default parallel harness (tracing's per-callsite `Interest` cache is shared
+    /// process-wide, so a concurrently-running test hitting the same log line without a
+    /// subscriber installed could race this test's own `set_default` guard); the marker itself is
+    /// plain, thread-isolated (per-`Ingest`-instance) state and has no such race.
     #[tokio::test]
     async fn known_gap_park_logs_once_until_released() {
         let log = TestLog::new();
@@ -499,19 +463,15 @@ mod tests {
                 let operation_3 = log.operation(b"He", ());
                 let operation_4 = log.operation(b"Hu", ());
 
+                let author = operation_0.header.verifying_key;
                 let log_id = 0;
+                let key = (author, log_id);
                 let topic = Topic::random();
                 let args = IngestArgs {
                     log_id,
                     topic,
                     prune_flag: false,
                 };
-
-                let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-                let _guard = tracing::subscriber::set_default(CountingSubscriber {
-                    target: "p2panda::stream::ooo_park",
-                    count: count.clone(),
-                });
 
                 // operation_0 establishes the frontier (seq_num=0).
                 ingest
@@ -521,8 +481,9 @@ mod tests {
                     })
                     .await
                     .unwrap();
+                assert!(!ingest.known_gap_park_logged.borrow().contains(&key));
 
-                // operation_2 parks on a known gap (missing operation_1) -- first park, must log.
+                // operation_2 parks on a known gap (missing operation_1) -- first park, must mark.
                 ingest
                     .process(Event {
                         operation: operation_2.clone(),
@@ -530,10 +491,11 @@ mod tests {
                     })
                     .await
                     .unwrap();
-                assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+                assert!(ingest.known_gap_park_logged.borrow().contains(&key));
+                assert_eq!(ingest.known_gap_park_logged.borrow().len(), 1);
 
-                // operation_3 parks behind operation_2 on the *same* still-open gap -- must NOT
-                // log again while it's still parked.
+                // operation_3 parks behind operation_2 on the *same* still-open gap -- still
+                // exactly one marker (idempotent `HashSet::insert` on an already-parked log).
                 ingest
                     .process(Event {
                         operation: operation_3.clone(),
@@ -542,13 +504,13 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(
-                    count.load(std::sync::atomic::Ordering::SeqCst),
+                    ingest.known_gap_park_logged.borrow().len(),
                     1,
-                    "a second park on the same still-open gap must not log again"
+                    "a second park on the same still-open gap must not add a second marker"
                 );
 
                 // operation_1 arrives, releasing operation_1, operation_2 and operation_3's chain
-                // (frontier now at seq_num=3).
+                // (frontier now at seq_num=3) -- marker cleared.
                 ingest
                     .process(Event {
                         operation: operation_1.clone(),
@@ -556,11 +518,15 @@ mod tests {
                     })
                     .await
                     .unwrap();
+                assert!(
+                    !ingest.known_gap_park_logged.borrow().contains(&key),
+                    "the marker must be cleared once the chain actually releases"
+                );
 
                 // operation_4 (seq_num=4) directly follows the just-released frontier
-                // (seq_num=3), so it inserts in-order rather than parking -- confirm no further
-                // log line fired for it (a sanity check on the release-then-insert path, not the
-                // "logs again" claim below).
+                // (seq_num=3), so it inserts in-order rather than parking -- confirm no marker
+                // (a sanity check on the release-then-insert path, not the "marks again" claim
+                // below).
                 ingest
                     .process(Event {
                         operation: operation_4.clone(),
@@ -568,10 +534,10 @@ mod tests {
                     })
                     .await
                     .unwrap();
-                assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+                assert!(ingest.known_gap_park_logged.borrow().is_empty());
 
                 // A brand new, separate stall on the SAME log after it fully released: deliver an
-                // operation at seq_num=6 while seq_num=5 never arrives. Must log again -- this is
+                // operation at seq_num=6 while seq_num=5 never arrives. Must mark again -- this is
                 // a fresh park, not a continuation of the first (already cleared on release).
                 let _operation_5_never_sent = log.operation(b"never sent", ());
                 let operation_6 = log.operation(b"Hy", ());
@@ -582,11 +548,10 @@ mod tests {
                     })
                     .await
                     .unwrap();
-                assert_eq!(
-                    count.load(std::sync::atomic::Ordering::SeqCst),
-                    2,
-                    "a later, separate stall on the same (author, log_id) after release must log \
-                     again, not stay silenced by the first park's marker"
+                assert!(
+                    ingest.known_gap_park_logged.borrow().contains(&key),
+                    "a later, separate stall on the same (author, log_id) after release must \
+                     mark again, not stay silenced by the first park's marker"
                 );
             })
             .await;

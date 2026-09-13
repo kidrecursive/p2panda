@@ -57,6 +57,32 @@ pub async fn drop_database(url: &str) -> Result<(), SqliteError> {
     Ok(())
 }
 
+/// square-tower fork addition (M4-22 fix round): reads back `PRAGMA journal_mode` / `PRAGMA
+/// busy_timeout` on a connection from the pool and logs them once at store open, so a runtime
+/// misconfiguration (e.g. an `:memory:` database silently keeping `journal_mode=memory` --
+/// expected and harmless, WAL doesn't apply there -- or, more seriously, a future regression that
+/// drops `with_pragmas` from a call site) is visible rather than silently assumed.
+async fn log_pragmas_once(pool: &sqlx::SqlitePool) {
+    let journal_mode: Result<(String,), _> = sqlx::query_as("PRAGMA journal_mode;")
+        .fetch_one(pool)
+        .await;
+    let busy_timeout: Result<(i64,), _> = sqlx::query_as("PRAGMA busy_timeout;")
+        .fetch_one(pool)
+        .await;
+    match (journal_mode, busy_timeout) {
+        (Ok((journal_mode,)), Ok((busy_timeout,))) => {
+            tracing::info!(journal_mode, busy_timeout, "sqlite store opened");
+        }
+        (journal_mode, busy_timeout) => {
+            warn!(
+                ?journal_mode,
+                ?busy_timeout,
+                "sqlite store opened, but reading back its own pragmas failed"
+            );
+        }
+    }
+}
+
 /// Creates the SQLite connection pool.
 pub async fn connection_pool(
     url: &str,
@@ -65,6 +91,7 @@ pub async fn connection_pool(
     let pool: sqlx::SqlitePool = with_pragmas(SqlitePoolOptions::new().max_connections(max_connections))
         .connect(url)
         .await?;
+    log_pragmas_once(&pool).await;
     Ok(pool)
 }
 
@@ -212,6 +239,8 @@ impl SqliteStoreBuilder {
         if self.run_migrations {
             run_pending_migrations(&pool).await?;
         }
+
+        log_pragmas_once(&pool).await;
 
         Ok(SqliteStore::new(pool))
     }
@@ -409,7 +438,20 @@ impl crate::traits::Transaction for SqliteStore {
             }
         }
 
-        let tx = self.pool.begin().await?;
+        // square-tower fork addition (M4-22 fix round): `BEGIN IMMEDIATE` instead of SQLite's
+        // default deferred `BEGIN`. A deferred transaction that reads first (as most of this
+        // store's write transactions do, e.g. `get_latest_entry_tx` before `insert_operation`)
+        // establishes its snapshot at that first read; under WAL, if any other connection commits
+        // a change before this transaction's own later write, the write fails immediately with
+        // `SQLITE_BUSY_SNAPSHOT` -- `PRAGMA busy_timeout` (`with_pragmas`, above) never helps this
+        // specific error, since it isn't lock contention this connection can usefully wait out
+        // (the fix is a fresh snapshot, not a longer wait). `BEGIN IMMEDIATE` acquires the write
+        // lock at the very start instead, so a transaction that would otherwise race a concurrent
+        // committer instead queues on the lock and waits (up to `busy_timeout`) like an ordinary
+        // writer-vs-writer conflict. Confirmed empirically (fleet chaos run on the pragma-only fix,
+        // `9d107819`): 19 distinct `database is locked` errors on control, still present despite
+        // WAL + busy_timeout=5000.
+        let tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         tx_ref.replace(tx);
 
         Ok(TransactionPermit::new(permit, self.tx.clone()))
@@ -958,5 +1000,66 @@ mod tests {
              writes)"
         );
     }
-}
 
+    /// M4-22 fix round: `SqliteStore::begin` must use `BEGIN IMMEDIATE`, not SQLite's default
+    /// deferred `BEGIN`. A deferred transaction that reads first (as most of this store's write
+    /// transactions do, e.g. ingest's `get_latest_entry_tx` before `insert_operation`) establishes
+    /// its snapshot at that read and takes no write lock at all until its own first write
+    /// statement; under WAL, if another connection commits a write in that window, this
+    /// transaction's own later write fails immediately with `SQLITE_BUSY_SNAPSHOT` --
+    /// `busy_timeout` never helps (it isn't lock contention to wait out; the fix needs a fresh
+    /// snapshot, not a longer wait). `BEGIN IMMEDIATE` acquires the write lock at `begin()` itself,
+    /// before any statement runs, closing that window entirely.
+    ///
+    /// Deterministic (no timing race, and no risk of the deadlock a "make B commit before A"
+    /// design would have under a correct fix -- B *can't* commit before A once A holds the lock
+    /// from `begin()`): open a transaction via the real `SqliteStore::begin` and, *before running
+    /// any statement on it*, have a second, independent connection (raw, straight from the pool)
+    /// attempt a write with `busy_timeout=0` -- so it fails immediately rather than waiting, if
+    /// blocked. Under `BEGIN IMMEDIATE`, that probe must find the table already locked (`begin()`
+    /// itself took the write lock). Under a plain deferred `BEGIN` (mutation below), `begin()`
+    /// alone takes no lock at all, so the same probe must succeed.
+    #[tokio::test]
+    async fn begin_takes_the_write_lock_immediately() {
+        let url = temp_db_url("begin-immediate");
+        let pool = connection_pool(&url, 4).await.unwrap();
+        let store = SqliteStore::from_pool(pool.clone());
+        store
+            .execute(async |pool| {
+                pool.execute("CREATE TABLE test(x INTEGER)").await?;
+                pool.execute("INSERT INTO test (x) VALUES (0)").await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        // A second, independent connection with `busy_timeout=0` -- fails fast instead of
+        // waiting, so this test doesn't need to guess a timeout long enough for CI.
+        let probe_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .after_connect(|conn, _meta| {
+                Box::pin(async move {
+                    conn.execute("PRAGMA busy_timeout=0;").await?;
+                    Ok(())
+                })
+            })
+            .connect(&url)
+            .await
+            .unwrap();
+
+        // `begin()` alone -- no statement run on this transaction yet.
+        let permit = store.begin().await.unwrap();
+
+        let probe_result = sqlx::query("UPDATE test SET x = 99")
+            .execute(&probe_pool)
+            .await;
+
+        store.rollback(permit).await.unwrap();
+
+        assert!(
+            is_locked_error(&probe_result.unwrap_err()),
+            "BEGIN IMMEDIATE must take the write lock at begin() itself, before any statement, \
+             so a concurrent writer's probe (busy_timeout=0) must fail immediately"
+        );
+    }
+}

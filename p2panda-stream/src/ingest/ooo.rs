@@ -198,8 +198,15 @@ where
                     // without this, [4]/[5] would stay buffered until *some other, later*
                     // out-of-order arrival happened to re-trigger a buffer check, which is not
                     // guaranteed to ever happen.
+                    // square-tower fork addition (M4-22): PEEK only -- do not actually remove
+                    // this chain from the ring yet. `ingest_operation` must insert every op in
+                    // `freed` into the store and commit successfully before the release becomes
+                    // real; see `commit_release` and its call site. Previously this drained the
+                    // ring immediately, so a transient store error on the following commit (which
+                    // rolls the DB back) still left the ring's copy of `freed` gone forever --
+                    // permanently losing every operation in the chain but the trigger itself.
                     let freed = self
-                        .pop_chain_after(operation.header.verifying_key, operation.hash, log_id)
+                        .peek_chain_after(operation.header.verifying_key, operation.hash, log_id)
                         .await;
                     if freed.is_empty() {
                         OooResult::InOrder(operation)
@@ -221,8 +228,9 @@ where
                     // => Push into ooo-Buffer.
                     // ```
                     //
-                    // We then check if this item freed any operations in ring-buffer.
-                    self.push_and_pop_from(operation, latest_header.backlink, log_id)
+                    // We then check if this item freed any operations in ring-buffer. (M4-22:
+                    // peek-only when it would -- see `peek_push_and_pop_from`.)
+                    self.peek_push_and_pop_from(operation, latest_header.backlink, log_id)
                         .await
                 }
             }
@@ -244,9 +252,50 @@ where
                 //
                 // We set the expected backlink to `None`, indicating that we are looking for the
                 // whole log / from seq_num=0.
-                self.push_and_pop_from(operation, None, log_id).await
+                self.peek_push_and_pop_from(operation, None, log_id).await
             }
         }
+    }
+
+    /// square-tower fork addition (M4-22): applies, for real, whichever release `process` last
+    /// *previewed* (`OooResult::Ordered`) for this exact `(operation, latest_header, log_id)` --
+    /// call only after the caller has successfully inserted every op in that preview into the
+    /// store and committed. Re-derives which of the two release paths (`pop_chain_after`'s
+    /// direct-in-order release, or `push_and_pop_from`'s out-of-order-push release) applies using
+    /// the identical branching `process` used, so the exact same chain that was previewed is the
+    /// one actually removed (nothing else mutates this buffer between the two calls under
+    /// `Ingest`'s single-threaded-per-topic processing model).
+    ///
+    /// Does nothing useful (and is safe to skip) for `InOrder`/`OutOfOrder`/`Outdated` results --
+    /// those never preview a release, so callers only need to call this after an `Ordered` result.
+    pub async fn commit_release(
+        &self,
+        operation: &Operation<E>,
+        latest_header: Option<&AnyHeader>,
+        log_id: &L,
+    ) {
+        match latest_header {
+            Some(latest_header)
+                if latest_header.seq_num == operation.header.seq_num.saturating_sub_signed(1) =>
+            {
+                self.pop_chain_after(operation.header.verifying_key, operation.hash, log_id)
+                    .await;
+            }
+            _ => {
+                let expected_backlink = latest_header.and_then(|header| header.backlink);
+                self.commit_push_and_pop_from(operation, expected_backlink, log_id)
+                    .await;
+            }
+        }
+    }
+
+    /// Non-mutating preview of what `pop_chain_after` (below) would remove -- see
+    /// `commit_release`, which performs the real removal once a preview's release has actually
+    /// been persisted to the store.
+    async fn peek_chain_after(&self, author: VerifyingKey, after: Hash, log_id: &L) -> Vec<Operation<E>> {
+        let buffer = self.buffer.lock().await;
+        let mut preview = buffer.clone();
+        preview.pop_from(author, Some(after), log_id.clone())
     }
 
     /// Pops (without pushing anything new) any chain of buffered operations whose first item's
@@ -256,6 +305,9 @@ where
     ///
     /// `author` scopes the chain walk to `operation`'s own author (see the module-level security
     /// note): only that author's own buffered entries can ever be released by this operation.
+    ///
+    /// M4-22: mutates the real ring -- only called from `commit_release`, after the store commit
+    /// for a previewed release (`peek_chain_after`) has already succeeded.
     async fn pop_chain_after(
         &self,
         author: VerifyingKey,
@@ -266,7 +318,17 @@ where
         buffer.pop_from(author, Some(after), log_id.clone())
     }
 
-    async fn push_and_pop_from<'a>(
+    /// Non-mutating preview of what pushing `operation` and then popping from `expected_backlink`
+    /// would yield -- does NOT touch the real ring for the release case (M4-22): if the preview
+    /// finds nothing to release, the push is safe to (and does) happen for real immediately,
+    /// since no store write follows an `OutOfOrder` result; if the preview finds a release, the
+    /// real ring is left completely untouched, and `commit_release` (`commit_push_and_pop_from`)
+    /// performs the real push+pop only after that release has actually been persisted. This
+    /// means a transient store error followed by an `ingest_operation` retry re-runs `process`
+    /// against the exact same, still-unmutated ring and re-derives the identical preview, instead
+    /// of the ring's copy of the release silently having drained out from under it (previously:
+    /// this pushed and popped for real unconditionally, before the store write was attempted).
+    async fn peek_push_and_pop_from<'a>(
         &self,
         operation: &'a Operation<E>,
         expected_backlink: Option<Hash>,
@@ -275,7 +337,43 @@ where
         let mut buffer = self.buffer.lock().await;
         let author = operation.header.verifying_key;
 
-        // Push item to ring-buffer, this will eventually evict old items when full.
+        let mut preview = buffer.clone();
+        preview.push(
+            author,
+            operation.hash,
+            operation.header.backlink,
+            log_id.clone(),
+            operation.clone(),
+        );
+        let result = preview.pop_from(author, expected_backlink, log_id.clone());
+
+        if result.is_empty() {
+            // No release: safe to actually push for real right now. `process` returns
+            // `OutOfOrder` immediately in this case (no store write follows), so there is no
+            // commit for a retry to need to re-derive against an unmutated ring.
+            buffer.push(
+                author,
+                operation.hash,
+                operation.header.backlink,
+                log_id.clone(),
+                operation.clone(),
+            );
+            OooResult::OutOfOrder
+        } else {
+            OooResult::Ordered(result)
+        }
+    }
+
+    /// M4-22: the real (mutating) push-then-pop, only ever called from `commit_release` once a
+    /// `peek_push_and_pop_from` preview's release has been persisted to the store.
+    async fn commit_push_and_pop_from(
+        &self,
+        operation: &Operation<E>,
+        expected_backlink: Option<Hash>,
+        log_id: &L,
+    ) {
+        let mut buffer = self.buffer.lock().await;
+        let author = operation.header.verifying_key;
         buffer.push(
             author,
             operation.hash,
@@ -283,30 +381,14 @@ where
             log_id.clone(),
             operation.clone(),
         );
-
-        // We should check if this item freed any operations in ring-buffer / made them "in-order".
-        // The check takes place from the current log frontier (`expected_backlink`) in the
-        // database. If it's `None` we don't have any items for the log yet in the database.
-        //
-        // ```text
-        //          [0] <- [1] <- Log in database
-        //
-        //          [3] <- Operation in ooo-Buffer
-        //
-        // [2] <- Incoming operation
-        //
-        // => Return [2, 3]
-        // ```
-        let result = buffer.pop_from(author, expected_backlink, log_id.clone());
-        if result.is_empty() {
-            OooResult::OutOfOrder
-        } else {
-            OooResult::Ordered(result)
-        }
+        buffer.pop_from(author, expected_backlink, log_id.clone());
     }
 }
 
-#[derive(Debug)]
+// square-tower fork addition (M4-22): `Clone` (needs `T: Clone`, `Operation<E>` already is) lets
+// `OooBuffer` cheaply snapshot the ring to *preview* a release without mutating the real one --
+// see `peek_chain_after`/`peek_push_and_pop_from`.
+#[derive(Debug, Clone)]
 struct ChainRing<A, ID, L, T>
 where
     A: Clone + Eq + StdHash,
@@ -317,7 +399,7 @@ where
     capacity: usize,
 }
 
-#[derive(Debug, Eq, PartialEq, StdHash)]
+#[derive(Debug, Eq, PartialEq, StdHash, Clone)]
 struct ChainRingKey<A, ID, L>
 where
     A: Clone + Eq + StdHash,
@@ -329,7 +411,7 @@ where
     log_id: L,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ChainRingValue<ID, T> {
     id: ID,
     item: T,

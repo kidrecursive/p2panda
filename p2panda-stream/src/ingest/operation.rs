@@ -169,6 +169,12 @@ where
     // 3. Out-of-order buffering (optional)
     // ====================================
 
+    // square-tower fork addition (M4-22): set only when `ooo` actually previewed a release
+    // (`OooResult::Ordered`) that still needs to be applied to the real ring -- see
+    // `OooBuffer::commit_release` and its call site below, after `store.commit` succeeds. `None`
+    // for every other outcome (nothing to commit-release).
+    let mut pending_release: Option<(&Operation<E>, Option<AnyHeader>)> = None;
+
     let result = if let Some(ooo) = ooo {
         // Get log frontier.
         let latest_header = store
@@ -183,18 +189,27 @@ where
             .process(operation, latest_header.as_ref(), log_id, prune_flag)
             .await
         {
-            // Operation is in-order, process it normally.
+            // Operation is in-order, process it normally. No release was previewed (an empty
+            // preview short-circuits to `InOrder` inside `process` itself), so there is nothing
+            // to commit-release here.
             OooResult::InOrder(operation) => {
                 check_log_and_insert(store, operation, log_id, topic, prune_flag).await?;
                 IngestResult::Inserted
             }
 
-            // Buffered operations are now in order, we process them all in bulk.
+            // Buffered operations are now in order, we process them all in bulk. M4-22: `ooo`
+            // only *previewed* this release (the real ring is untouched) -- insert every op and
+            // commit first, then apply the release for real (`pending_release`, below) only once
+            // that succeeds. If the commit fails (including a transient error a caller retries),
+            // the ring is exactly as it was before this attempt, so a retry re-derives the
+            // identical preview instead of the preview's items being gone from both the ring and
+            // the (rolled-back) store.
             OooResult::Ordered(operations) => {
                 for operation in &operations {
                     check_log_and_insert(store, operation, log_id, topic, prune_flag).await?;
                 }
 
+                pending_release = Some((operation, latest_header.clone()));
                 IngestResult::Ordered(operations)
             }
 
@@ -224,6 +239,19 @@ where
         .commit(permit)
         .await
         .map_err(|err| IngestError::StoreError(err.to_string()))?;
+
+    // square-tower fork addition (M4-22): the store commit above just succeeded, so it's now
+    // safe to apply the release `ooo` only previewed earlier -- see `pending_release` and
+    // `OooBuffer::commit_release`. Must run only after `commit` returns `Ok`: on any earlier
+    // error (including a caller's retry of the whole function), the ring was never touched by the
+    // preview, so nothing needs undoing there.
+    if let Some((operation, latest_header)) = pending_release {
+        // `ooo` is always `Some` here: `pending_release` is only ever set inside the `if let
+        // Some(ooo) = ooo` branch above.
+        ooo.expect("pending_release only set when ooo is Some")
+            .commit_release(operation, latest_header.as_ref(), log_id)
+            .await;
+    }
 
     Ok(result)
 }
@@ -970,6 +998,332 @@ mod m4_22_retry_tests {
             !persisted,
             "without the retry loop, the operation must be dropped (not persisted) -- this is \
              the M4-22 incident this fix closes"
+        );
+    }
+}
+
+/// M4-22 fix-round: the retry must be atomic with the ooo ring. `ingest_operation`'s ooo release
+/// (`OooBuffer::process`) previously mutated the ring (drained a released chain out of it) BEFORE
+/// the batch's inserts and `store.commit()`; on a transient commit error the retry re-ran
+/// `ingest_operation_attempt` with only the trigger op, but the ring no longer held the rest of
+/// the chain (already drained) and the DB had rolled the inserts back -- the released ops were
+/// lost from both. Fixed by previewing the release without mutating the ring
+/// (`OooBuffer::peek_chain_after` / `peek_push_and_pop_from`) and only draining it for real
+/// (`commit_release`) after `store.commit` returns `Ok`.
+#[cfg(test)]
+mod m4_22_ooo_retry_atomicity_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use p2panda_core::test_utils::TestLog;
+    use p2panda_core::{AnyOperation, Extensions, Hash, LogId, Operation, SeqNum, VerifyingKey};
+    use p2panda_store::Transaction;
+    use p2panda_store::logs::LogStore;
+    use p2panda_store::operations::OperationStore;
+    use p2panda_store::sqlite::{SqliteError, SqliteStore, TransactionPermit};
+    use p2panda_store::topics::TopicStore;
+
+    use crate::ingest::ooo::OooBuffer;
+
+    use super::{IngestResult, ingest_operation};
+
+    /// Wraps a real `SqliteStore`; `commit` fails with a transient-looking store error
+    /// ("database is locked") exactly `failures` times (across the *whole* store, not scoped to
+    /// one operation -- mirrors "the first commit" of a release batch failing), then behaves
+    /// normally. Everything else delegates straight through.
+    #[derive(Clone)]
+    struct FaultyCommitStore {
+        inner: SqliteStore,
+        remaining_failures: Arc<AtomicU32>,
+    }
+
+    impl FaultyCommitStore {
+        fn new(inner: SqliteStore, failures: u32) -> Self {
+            Self {
+                inner,
+                remaining_failures: Arc::new(AtomicU32::new(failures)),
+            }
+        }
+    }
+
+    impl Transaction for FaultyCommitStore {
+        type Error = SqliteError;
+        type Permit = TransactionPermit;
+
+        async fn begin(&self) -> Result<Self::Permit, Self::Error> {
+            self.inner.begin().await
+        }
+
+        async fn rollback(&self, permit: Self::Permit) -> Result<(), Self::Error> {
+            self.inner.rollback(permit).await
+        }
+
+        async fn commit(&self, permit: Self::Permit) -> Result<(), Self::Error> {
+            let remaining = self.remaining_failures.load(Ordering::SeqCst);
+            if remaining > 0
+                && self
+                    .remaining_failures
+                    .compare_exchange(remaining, remaining - 1, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            {
+                // Roll back for real (mirrors what a real failed commit leaves behind: nothing
+                // persisted), then report the transient error `ingest_operation` retries on.
+                self.inner.rollback(permit).await.ok();
+                return Err(SqliteError::Sqlite(sqlx::Error::InvalidArgument(
+                    "database is locked".to_string(),
+                )));
+            }
+            self.inner.commit(permit).await
+        }
+    }
+
+    impl<E> OperationStore<Operation<E>, Hash> for FaultyCommitStore
+    where
+        E: Extensions,
+    {
+        type Error = SqliteError;
+
+        async fn insert_operation<L: LogId>(
+            &self,
+            id: &Hash,
+            operation: &Operation<E>,
+            log_id: &L,
+        ) -> Result<bool, Self::Error> {
+            self.inner.insert_operation(id, operation, log_id).await
+        }
+
+        async fn get_operation(&self, id: &Hash) -> Result<Option<Operation<E>>, Self::Error> {
+            self.inner.get_operation(id).await
+        }
+
+        async fn get_operation_tx(&self, id: &Hash) -> Result<Option<Operation<E>>, Self::Error> {
+            self.inner.get_operation_tx(id).await
+        }
+
+        async fn has_operation(&self, id: &Hash) -> Result<bool, Self::Error> {
+            <SqliteStore as OperationStore<Operation<E>, Hash>>::has_operation(&self.inner, id)
+                .await
+        }
+
+        async fn has_operation_tx(&self, id: &Hash) -> Result<bool, Self::Error> {
+            <SqliteStore as OperationStore<Operation<E>, Hash>>::has_operation_tx(&self.inner, id)
+                .await
+        }
+
+        async fn delete_operation(&self, id: &Hash) -> Result<bool, Self::Error> {
+            <SqliteStore as OperationStore<Operation<E>, Hash>>::delete_operation(&self.inner, id)
+                .await
+        }
+
+        async fn delete_operation_payload(&self, id: &Hash) -> Result<bool, Self::Error> {
+            <SqliteStore as OperationStore<Operation<E>, Hash>>::delete_operation_payload(
+                &self.inner,
+                id,
+            )
+            .await
+        }
+    }
+
+    impl<L> LogStore<AnyOperation, VerifyingKey, L, SeqNum, Hash> for FaultyCommitStore
+    where
+        L: LogId + Send + Sync + 'static,
+    {
+        type Error = SqliteError;
+
+        async fn get_latest_entry(
+            &self,
+            author: &VerifyingKey,
+            log_id: &L,
+        ) -> Result<Option<AnyOperation>, Self::Error> {
+            <SqliteStore as LogStore<AnyOperation, VerifyingKey, L, SeqNum, Hash>>::get_latest_entry(
+                &self.inner, author, log_id,
+            )
+            .await
+        }
+
+        async fn get_latest_entry_tx(
+            &self,
+            author: &VerifyingKey,
+            log_id: &L,
+        ) -> Result<Option<AnyOperation>, Self::Error> {
+            <SqliteStore as LogStore<AnyOperation, VerifyingKey, L, SeqNum, Hash>>::get_latest_entry_tx(
+                &self.inner, author, log_id,
+            )
+            .await
+        }
+
+        async fn get_log_heights(
+            &self,
+            author: &VerifyingKey,
+            logs: &[L],
+        ) -> Result<Option<std::collections::BTreeMap<L, SeqNum>>, Self::Error> {
+            <SqliteStore as LogStore<AnyOperation, VerifyingKey, L, SeqNum, Hash>>::get_log_heights(
+                &self.inner, author, logs,
+            )
+            .await
+        }
+
+        async fn get_log_size(
+            &self,
+            author: &VerifyingKey,
+            log_id: &L,
+            after: Option<SeqNum>,
+            until: Option<SeqNum>,
+        ) -> Result<Option<(u32, u32)>, Self::Error> {
+            <SqliteStore as LogStore<AnyOperation, VerifyingKey, L, SeqNum, Hash>>::get_log_size(
+                &self.inner,
+                author,
+                log_id,
+                after,
+                until,
+            )
+            .await
+        }
+
+        fn log_entries(
+            &self,
+            author: &VerifyingKey,
+            log_id: &L,
+            after: Option<SeqNum>,
+            until: Option<SeqNum>,
+        ) -> Result<
+            futures_util::stream::BoxStream<
+                'static,
+                Result<p2panda_store::logs::StreamItem<AnyOperation, L>, Self::Error>,
+            >,
+            Self::Error,
+        > {
+            <SqliteStore as LogStore<AnyOperation, VerifyingKey, L, SeqNum, Hash>>::log_entries(
+                &self.inner, author, log_id, after, until,
+            )
+        }
+
+        async fn prune_entries(
+            &self,
+            author: &VerifyingKey,
+            log_id: &L,
+            until: &SeqNum,
+        ) -> Result<u64, Self::Error> {
+            <SqliteStore as LogStore<AnyOperation, VerifyingKey, L, SeqNum, Hash>>::prune_entries(
+                &self.inner, author, log_id, until,
+            )
+            .await
+        }
+    }
+
+    impl<T, L> TopicStore<T, VerifyingKey, L> for FaultyCommitStore
+    where
+        SqliteStore: TopicStore<T, VerifyingKey, L>,
+    {
+        type Error = <SqliteStore as TopicStore<T, VerifyingKey, L>>::Error;
+
+        async fn associate(
+            &self,
+            topic: &T,
+            author: &VerifyingKey,
+            data_id: &L,
+        ) -> Result<bool, Self::Error> {
+            <SqliteStore as TopicStore<T, VerifyingKey, L>>::associate(
+                &self.inner, topic, author, data_id,
+            )
+            .await
+        }
+
+        async fn remove(
+            &self,
+            topic: &T,
+            author: &VerifyingKey,
+            data_id: &L,
+        ) -> Result<bool, Self::Error> {
+            <SqliteStore as TopicStore<T, VerifyingKey, L>>::remove(
+                &self.inner, topic, author, data_id,
+            )
+            .await
+        }
+
+        async fn resolve(
+            &self,
+            topic: &T,
+        ) -> Result<std::collections::BTreeMap<VerifyingKey, Vec<L>>, Self::Error> {
+            <SqliteStore as TopicStore<T, VerifyingKey, L>>::resolve(&self.inner, topic).await
+        }
+
+        async fn resolve_topics(
+            &self,
+            author: &VerifyingKey,
+            data_id: &L,
+        ) -> Result<Vec<T>, Self::Error> {
+            <SqliteStore as TopicStore<T, VerifyingKey, L>>::resolve_topics(
+                &self.inner, author, data_id,
+            )
+            .await
+        }
+
+        async fn topics(&self) -> Result<Vec<T>, Self::Error> {
+            <SqliteStore as TopicStore<T, VerifyingKey, L>>::topics(&self.inner).await
+        }
+    }
+
+    /// Parks 2 ops, delivers the trigger releasing a 3-op chain, injects ONE transient
+    /// `StoreError` on the first commit -- the retry must re-derive the identical release and
+    /// end up with all 3 ops persisted.
+    #[tokio::test]
+    async fn retry_recovers_full_release_batch_after_transient_commit_error() {
+        let inner = SqliteStore::temporary().await;
+        let log = TestLog::new();
+        let ooo = OooBuffer::new();
+        let log_id = 1;
+        let topic = 1;
+
+        // seq_num 0..=3.
+        let operation_0 = log.operation(b"frontier", ());
+        let operation_1 = log.operation(b"trigger", ());
+        let operation_2 = log.operation(b"parked-1", ());
+        let operation_3 = log.operation(b"parked-2", ());
+
+        // Establish the frontier at seq_num=0 (no faulting yet, plain inner store).
+        ingest_operation(&inner, Some(&ooo), &operation_0, &log_id, &topic, false)
+            .await
+            .unwrap();
+
+        // Park operation_2 and operation_3 out of order (no store write on this path -- see
+        // `OooResult::OutOfOrder` in `ooo.rs` -- so the plain inner store is fine here too).
+        ingest_operation(&inner, Some(&ooo), &operation_2, &log_id, &topic, false)
+            .await
+            .unwrap();
+        ingest_operation(&inner, Some(&ooo), &operation_3, &log_id, &topic, false)
+            .await
+            .unwrap();
+        assert_eq!(ooo.len().await, 2, "both parked ops sit in the ring");
+
+        // Now deliver the trigger (operation_1) through the fault-injecting store: releases
+        // [operation_1, operation_2, operation_3], but the first commit attempt fails transiently.
+        let faulty = FaultyCommitStore::new(inner.clone(), 1);
+        let result = ingest_operation(&faulty, Some(&ooo), &operation_1, &log_id, &topic, false)
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, IngestResult::Ordered(ref ops) if ops.len() == 3),
+            "the retry must recover the full 3-op release, got {result:?}"
+        );
+
+        for operation in [&operation_1, &operation_2, &operation_3] {
+            let persisted = OperationStore::<Operation<()>, Hash>::has_operation(
+                &inner,
+                &operation.hash,
+            )
+            .await
+            .unwrap();
+            assert!(
+                persisted,
+                "op {:?} must be persisted after the retry recovers the full release batch",
+                operation.hash
+            );
+        }
+        assert_eq!(
+            ooo.len().await,
+            0,
+            "the ring must be fully drained of the released chain after a successful retry"
         );
     }
 }
