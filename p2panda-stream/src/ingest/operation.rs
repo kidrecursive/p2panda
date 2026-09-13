@@ -40,6 +40,28 @@ pub enum IngestResult<E> {
     Outdated,
 }
 
+/// square-tower fork addition (M4-22): number of attempts `ingest_operation` makes for the whole
+/// begin -> classify -> commit span before surfacing a transient store error
+/// (`IngestError::StoreError`) to the caller. 1 initial attempt + 3 retries.
+const INGEST_RETRY_ATTEMPTS: usize = 4;
+
+/// square-tower fork addition (M4-22): backoff before each retry (index 0 is the delay before the
+/// *first* retry, i.e. after the initial attempt fails).
+const INGEST_RETRY_BACKOFF: [std::time::Duration; INGEST_RETRY_ATTEMPTS - 1] = [
+    std::time::Duration::from_millis(10),
+    std::time::Duration::from_millis(50),
+    std::time::Duration::from_millis(250),
+];
+
+/// square-tower fork addition (M4-22): whether a store error is transient (SQLite's connection
+/// briefly contended -- `SQLITE_BUSY` / "database is locked", see
+/// `docs/upstream/p2panda-ingest-drop-recovery.md`) and therefore worth retrying the whole
+/// begin -> classify -> commit span for, as opposed to a structural/critical failure that should
+/// surface immediately.
+fn is_transient_store_error(message: &str) -> bool {
+    message.contains("database is locked") || message.contains("SQLITE_BUSY")
+}
+
 /// Checks an incoming operation to ensure correct formatting and log integrity before persisting it
 /// into the store when valid. This function is idempotent; duplicate operations are ignored.
 ///
@@ -49,11 +71,59 @@ pub enum IngestResult<E> {
 /// Can optionally be extended with an [`OooBuffer`] (Out-Of-Order) for offering a configurable
 /// window for incoming operations to wait in memory if they can't be validated yet due to missing
 /// predecessors.
+///
+/// square-tower fork addition (M4-22): retries the whole begin -> classify -> commit span up to
+/// `INGEST_RETRY_ATTEMPTS` times, with backoff, when the store reports a transient error
+/// (`is_transient_store_error`) -- e.g. `SQLITE_BUSY`/"database is locked" from a momentarily
+/// contended connection. Without this, a single transient error on `commit`/`insert_operation`
+/// silently dropped the operation: every later operation on that log then parked as a
+/// known-gap `OutOfOrder`, invisibly, until the ooo ring evicted it (see
+/// `docs/upstream/p2panda-ingest-drop-recovery.md`).
 pub async fn ingest_operation<S, L, E, TP>(
     store: &S,
     ooo: Option<&OooBuffer<L, E>>,
     // TODO: We probably want to use AnyOperation here and convert to Operation<E> in the ingest
     // processor (and not inside of this method).
+    operation: &Operation<E>,
+    log_id: &L,
+    topic: &TP,
+    prune_flag: bool,
+) -> Result<IngestResult<E>, IngestError>
+where
+    S: Transaction
+        + OperationStore<Operation<E>, Hash>
+        + LogStore<AnyOperation, VerifyingKey, L, SeqNum, Hash>
+        + TopicStore<TP, VerifyingKey, L>,
+    L: LogId,
+    E: Extensions,
+{
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match ingest_operation_attempt(store, ooo, operation, log_id, topic, prune_flag).await {
+            Err(IngestError::StoreError(message)) if is_transient_store_error(&message) => {
+                if attempt >= INGEST_RETRY_ATTEMPTS {
+                    return Err(IngestError::StoreError(message));
+                }
+                let backoff = INGEST_RETRY_BACKOFF[attempt - 1];
+                tracing::warn!(
+                    operation_hash = %operation.hash,
+                    attempt,
+                    max_attempts = INGEST_RETRY_ATTEMPTS,
+                    backoff_ms = backoff.as_millis(),
+                    error = %message,
+                    "ingest hit a transient store error, retrying",
+                );
+                tokio::time::sleep(backoff).await;
+            }
+            other => return other,
+        }
+    }
+}
+
+async fn ingest_operation_attempt<S, L, E, TP>(
+    store: &S,
+    ooo: Option<&OooBuffer<L, E>>,
     operation: &Operation<E>,
     log_id: &L,
     topic: &TP,
@@ -547,6 +617,359 @@ mod tests {
         assert_eq!(
             result,
             Ok(IngestResult::Ordered(vec![operation_1, operation_2]))
+        );
+    }
+}
+
+/// M4-22: `ingest_operation` retries a transient store error (`SQLITE_BUSY`/"database is locked")
+/// instead of silently dropping the operation. Reuses the fault-injection `FaultyStore` shape
+/// from the root-cause repro (scratchpad `refute-ooo/h1/operation.rs.with_test`): a real
+/// `SqliteStore` wrapped so exactly one targeted `insert_operation` call fails, standing in for a
+/// single transient store contention -- `ingest_operation` folds every store error into
+/// `IngestError::StoreError` via `.to_string()`, so any genuine store error exercises the same
+/// real production code path the incident hit.
+#[cfg(test)]
+mod m4_22_retry_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    use p2panda_core::test_utils::TestLog;
+    use p2panda_core::{AnyOperation, Extensions, Hash, LogId, Operation, SeqNum, VerifyingKey};
+    use p2panda_store::Transaction;
+    use p2panda_store::logs::LogStore;
+    use p2panda_store::operations::OperationStore;
+    use p2panda_store::sqlite::{SqliteError, SqliteStore, TransactionPermit};
+    use p2panda_store::topics::TopicStore;
+
+    use super::{IngestResult, ingest_operation, ingest_operation_attempt};
+
+    /// Wraps a real `SqliteStore`; `insert_operation` fails with a transient-looking store error
+    /// ("database is locked", matching `is_transient_store_error`) for `fail_hash`, exactly
+    /// `failures` times, then behaves normally -- standing in for a store that's momentarily
+    /// contended and then recovers, exactly the scenario `is_transient_store_error` classifies as
+    /// worth retrying.
+    #[derive(Clone)]
+    struct FaultyStore {
+        inner: SqliteStore,
+        fail_hash: Hash,
+        remaining_failures: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    impl FaultyStore {
+        fn new(inner: SqliteStore, fail_hash: Hash, failures: u32) -> Self {
+            Self {
+                inner,
+                fail_hash,
+                remaining_failures: Arc::new(std::sync::atomic::AtomicU32::new(failures)),
+            }
+        }
+
+        fn locked_error() -> SqliteError {
+            SqliteError::Sqlite(sqlx::Error::InvalidArgument("database is locked".to_string()))
+        }
+    }
+
+    impl Transaction for FaultyStore {
+        type Error = SqliteError;
+        type Permit = TransactionPermit;
+
+        async fn begin(&self) -> Result<Self::Permit, Self::Error> {
+            self.inner.begin().await
+        }
+
+        async fn rollback(&self, permit: Self::Permit) -> Result<(), Self::Error> {
+            self.inner.rollback(permit).await
+        }
+
+        async fn commit(&self, permit: Self::Permit) -> Result<(), Self::Error> {
+            self.inner.commit(permit).await
+        }
+    }
+
+    impl<E> OperationStore<Operation<E>, Hash> for FaultyStore
+    where
+        E: Extensions,
+    {
+        type Error = SqliteError;
+
+        async fn insert_operation<L: LogId>(
+            &self,
+            id: &Hash,
+            operation: &Operation<E>,
+            log_id: &L,
+        ) -> Result<bool, Self::Error> {
+            if *id == self.fail_hash {
+                let remaining = self.remaining_failures.load(Ordering::SeqCst);
+                if remaining > 0
+                    && self
+                        .remaining_failures
+                        .compare_exchange(
+                            remaining,
+                            remaining - 1,
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        )
+                        .is_ok()
+                {
+                    return Err(Self::locked_error());
+                }
+            }
+            self.inner.insert_operation(id, operation, log_id).await
+        }
+
+        async fn get_operation(&self, id: &Hash) -> Result<Option<Operation<E>>, Self::Error> {
+            self.inner.get_operation(id).await
+        }
+
+        async fn get_operation_tx(&self, id: &Hash) -> Result<Option<Operation<E>>, Self::Error> {
+            self.inner.get_operation_tx(id).await
+        }
+
+        async fn has_operation(&self, id: &Hash) -> Result<bool, Self::Error> {
+            <SqliteStore as OperationStore<Operation<E>, Hash>>::has_operation(&self.inner, id)
+                .await
+        }
+
+        async fn has_operation_tx(&self, id: &Hash) -> Result<bool, Self::Error> {
+            <SqliteStore as OperationStore<Operation<E>, Hash>>::has_operation_tx(&self.inner, id)
+                .await
+        }
+
+        async fn delete_operation(&self, id: &Hash) -> Result<bool, Self::Error> {
+            <SqliteStore as OperationStore<Operation<E>, Hash>>::delete_operation(&self.inner, id)
+                .await
+        }
+
+        async fn delete_operation_payload(&self, id: &Hash) -> Result<bool, Self::Error> {
+            <SqliteStore as OperationStore<Operation<E>, Hash>>::delete_operation_payload(
+                &self.inner,
+                id,
+            )
+            .await
+        }
+    }
+
+    impl<L> LogStore<AnyOperation, VerifyingKey, L, SeqNum, Hash> for FaultyStore
+    where
+        L: LogId + Send + Sync + 'static,
+    {
+        type Error = SqliteError;
+
+        async fn get_latest_entry(
+            &self,
+            author: &VerifyingKey,
+            log_id: &L,
+        ) -> Result<Option<AnyOperation>, Self::Error> {
+            <SqliteStore as LogStore<AnyOperation, VerifyingKey, L, SeqNum, Hash>>::get_latest_entry(
+                &self.inner, author, log_id,
+            )
+            .await
+        }
+
+        async fn get_latest_entry_tx(
+            &self,
+            author: &VerifyingKey,
+            log_id: &L,
+        ) -> Result<Option<AnyOperation>, Self::Error> {
+            <SqliteStore as LogStore<AnyOperation, VerifyingKey, L, SeqNum, Hash>>::get_latest_entry_tx(
+                &self.inner, author, log_id,
+            )
+            .await
+        }
+
+        async fn get_log_heights(
+            &self,
+            author: &VerifyingKey,
+            logs: &[L],
+        ) -> Result<Option<std::collections::BTreeMap<L, SeqNum>>, Self::Error> {
+            <SqliteStore as LogStore<AnyOperation, VerifyingKey, L, SeqNum, Hash>>::get_log_heights(
+                &self.inner, author, logs,
+            )
+            .await
+        }
+
+        async fn get_log_size(
+            &self,
+            author: &VerifyingKey,
+            log_id: &L,
+            after: Option<SeqNum>,
+            until: Option<SeqNum>,
+        ) -> Result<Option<(u32, u32)>, Self::Error> {
+            <SqliteStore as LogStore<AnyOperation, VerifyingKey, L, SeqNum, Hash>>::get_log_size(
+                &self.inner,
+                author,
+                log_id,
+                after,
+                until,
+            )
+            .await
+        }
+
+        fn log_entries(
+            &self,
+            author: &VerifyingKey,
+            log_id: &L,
+            after: Option<SeqNum>,
+            until: Option<SeqNum>,
+        ) -> Result<
+            futures_util::stream::BoxStream<
+                'static,
+                Result<p2panda_store::logs::StreamItem<AnyOperation, L>, Self::Error>,
+            >,
+            Self::Error,
+        > {
+            <SqliteStore as LogStore<AnyOperation, VerifyingKey, L, SeqNum, Hash>>::log_entries(
+                &self.inner, author, log_id, after, until,
+            )
+        }
+
+        async fn prune_entries(
+            &self,
+            author: &VerifyingKey,
+            log_id: &L,
+            until: &SeqNum,
+        ) -> Result<u64, Self::Error> {
+            <SqliteStore as LogStore<AnyOperation, VerifyingKey, L, SeqNum, Hash>>::prune_entries(
+                &self.inner, author, log_id, until,
+            )
+            .await
+        }
+    }
+
+    impl<T, L> TopicStore<T, VerifyingKey, L> for FaultyStore
+    where
+        SqliteStore: TopicStore<T, VerifyingKey, L>,
+    {
+        type Error = <SqliteStore as TopicStore<T, VerifyingKey, L>>::Error;
+
+        async fn associate(
+            &self,
+            topic: &T,
+            author: &VerifyingKey,
+            data_id: &L,
+        ) -> Result<bool, Self::Error> {
+            <SqliteStore as TopicStore<T, VerifyingKey, L>>::associate(
+                &self.inner, topic, author, data_id,
+            )
+            .await
+        }
+
+        async fn remove(
+            &self,
+            topic: &T,
+            author: &VerifyingKey,
+            data_id: &L,
+        ) -> Result<bool, Self::Error> {
+            <SqliteStore as TopicStore<T, VerifyingKey, L>>::remove(
+                &self.inner, topic, author, data_id,
+            )
+            .await
+        }
+
+        async fn resolve(
+            &self,
+            topic: &T,
+        ) -> Result<std::collections::BTreeMap<VerifyingKey, Vec<L>>, Self::Error> {
+            <SqliteStore as TopicStore<T, VerifyingKey, L>>::resolve(&self.inner, topic).await
+        }
+
+        async fn resolve_topics(
+            &self,
+            author: &VerifyingKey,
+            data_id: &L,
+        ) -> Result<Vec<T>, Self::Error> {
+            <SqliteStore as TopicStore<T, VerifyingKey, L>>::resolve_topics(
+                &self.inner, author, data_id,
+            )
+            .await
+        }
+
+        async fn topics(&self) -> Result<Vec<T>, Self::Error> {
+            <SqliteStore as TopicStore<T, VerifyingKey, L>>::topics(&self.inner).await
+        }
+    }
+
+    /// A single transient failure (mirrors one "database is locked" event on real contention):
+    /// `ingest_operation`'s retry must recover, and the op ends up `Inserted`, actually persisted.
+    #[tokio::test]
+    async fn retries_single_transient_failure_and_inserts() {
+        let inner = SqliteStore::temporary().await;
+        let log = TestLog::new();
+        let operation = log.operation(b"flaky write", ());
+
+        let store = FaultyStore::new(inner.clone(), operation.hash, 1);
+
+        let result = ingest_operation(&store, None, &operation, &1, &1, false).await;
+        assert_eq!(
+            result,
+            Ok(IngestResult::Inserted),
+            "a single transient store error must be retried into a successful Inserted, not \
+             surfaced to the caller"
+        );
+
+        let persisted = OperationStore::<Operation<()>, Hash>::has_operation(&inner, &operation.hash)
+            .await
+            .unwrap();
+        assert!(
+            persisted,
+            "the operation must actually be persisted after the retry recovers, not merely \
+             reported as Inserted"
+        );
+    }
+
+    /// Exhausts all retries (4 attempts total: `INGEST_RETRY_ATTEMPTS`): `ingest_operation` must
+    /// give up and surface the store error, exactly like the pre-fix behaviour.
+    #[tokio::test]
+    async fn gives_up_after_exhausting_retries() {
+        let inner = SqliteStore::temporary().await;
+        let log = TestLog::new();
+        let operation = log.operation(b"always flaky", ());
+
+        // More failures than INGEST_RETRY_ATTEMPTS (4) -- every attempt fails.
+        let store = FaultyStore::new(inner.clone(), operation.hash, 10);
+
+        let result = ingest_operation(&store, None, &operation, &1, &1, false).await;
+        assert!(
+            matches!(result, Err(super::IngestError::StoreError(_))),
+            "exhausting every retry must surface the store error to the caller, got {result:?}"
+        );
+
+        let persisted = OperationStore::<Operation<()>, Hash>::has_operation(&inner, &operation.hash)
+            .await
+            .unwrap();
+        assert!(
+            !persisted,
+            "an operation that never got past a permanently failing store must not be persisted"
+        );
+    }
+
+    /// Mutation: calling the un-retried, single-attempt `ingest_operation_attempt` directly (i.e.
+    /// today's pre-fix behaviour, with the retry loop bypassed) must silently drop the operation
+    /// on the very same single transient failure that `retries_single_transient_failure_and_inserts`
+    /// shows the retry-wrapped `ingest_operation` recovers from -- proving this test is actually
+    /// sensitive to the retry loop's presence, not to some incidental property of the fault.
+    #[tokio::test]
+    async fn without_retry_a_single_transient_failure_is_dropped() {
+        let inner = SqliteStore::temporary().await;
+        let log = TestLog::new();
+        let operation = log.operation(b"flaky write, no retry", ());
+
+        let store = FaultyStore::new(inner.clone(), operation.hash, 1);
+
+        let result = ingest_operation_attempt(&store, None, &operation, &1, &1, false).await;
+        assert!(
+            matches!(result, Err(super::IngestError::StoreError(_))),
+            "without the retry loop, a single transient failure must surface as a StoreError \
+             (today's pre-fix, dropped-write behaviour), got {result:?}"
+        );
+
+        let persisted = OperationStore::<Operation<()>, Hash>::has_operation(&inner, &operation.hash)
+            .await
+            .unwrap();
+        assert!(
+            !persisted,
+            "without the retry loop, the operation must be dropped (not persisted) -- this is \
+             the M4-22 incident this fix closes"
         );
     }
 }
