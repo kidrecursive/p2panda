@@ -29,13 +29,29 @@ const SQLITE_JOURNAL_MODE_PRAGMA: &str = "PRAGMA journal_mode=wal;";
 /// `SQLITE_BUSY`/`database is locked`, instead of failing immediately.
 const SQLITE_BUSY_TIMEOUT_PRAGMA: &str = "PRAGMA busy_timeout=5000;";
 
-/// Applies the fork's `PRAGMA journal_mode` / `PRAGMA busy_timeout` to every connection opened by
-/// the pool (M4-22).
+/// square-tower fork addition (M4-24): synchronous level applied to every pool connection on
+/// open.
+///
+/// Under WAL, `synchronous=FULL` (SQLite's default) fsyncs the WAL file once per commit, so
+/// every `BEGIN IMMEDIATE` write transaction (ingest, orderer, ack) pays a full fsync -- on a
+/// slow/fsync-bound disk this caps ingest throughput well below the publish rate of a few
+/// drones (D24). `synchronous=NORMAL` under WAL is still crash-safe (a checkpoint always leaves a
+/// consistent database; SQLite's own WAL durability guarantee holds), it only relaxes the
+/// *ordering* guarantee across a process/OS crash: the most recent commit(s) since the last WAL
+/// checkpoint may be rolled back on restart if the machine loses power before that checkpoint's
+/// fsync. This is the documented trade-off recorded in D24 -- acceptable here because the
+/// example's payload is re-publishable telemetry, not a ledger. Never weaken `BEGIN IMMEDIATE`
+/// (that guards the *lock*, this pragma guards the *fsync*; they are orthogonal, see M4-22).
+const SQLITE_SYNCHRONOUS_PRAGMA: &str = "PRAGMA synchronous=NORMAL;";
+
+/// Applies the fork's `PRAGMA journal_mode` / `PRAGMA busy_timeout` / `PRAGMA synchronous` to
+/// every connection opened by the pool (M4-22, M4-24).
 fn with_pragmas(options: SqlitePoolOptions) -> SqlitePoolOptions {
     options.after_connect(|conn, _meta| {
         Box::pin(async move {
             conn.execute(SQLITE_JOURNAL_MODE_PRAGMA).await?;
             conn.execute(SQLITE_BUSY_TIMEOUT_PRAGMA).await?;
+            conn.execute(SQLITE_SYNCHRONOUS_PRAGMA).await?;
             Ok(())
         })
     })
@@ -69,14 +85,26 @@ async fn log_pragmas_once(pool: &sqlx::SqlitePool) {
     let busy_timeout: Result<(i64,), _> = sqlx::query_as("PRAGMA busy_timeout;")
         .fetch_one(pool)
         .await;
-    match (journal_mode, busy_timeout) {
-        (Ok((journal_mode,)), Ok((busy_timeout,))) => {
-            tracing::info!(journal_mode, busy_timeout, "sqlite store opened");
+    // square-tower fork addition (M4-24): also read back `synchronous` so a regression (e.g. a
+    // future call site that drops `with_pragmas`) is visible in the same log line rather than
+    // silently reverting to SQLite's default `FULL`.
+    let synchronous: Result<(i64,), _> = sqlx::query_as("PRAGMA synchronous;")
+        .fetch_one(pool)
+        .await;
+    match (journal_mode, busy_timeout, synchronous) {
+        (Ok((journal_mode,)), Ok((busy_timeout,)), Ok((synchronous,))) => {
+            tracing::info!(
+                journal_mode,
+                busy_timeout,
+                synchronous,
+                "sqlite store opened"
+            );
         }
-        (journal_mode, busy_timeout) => {
+        (journal_mode, busy_timeout, synchronous) => {
             warn!(
                 ?journal_mode,
                 ?busy_timeout,
+                ?synchronous,
                 "sqlite store opened, but reading back its own pragmas failed"
             );
         }
@@ -365,7 +393,23 @@ impl SqliteStore {
         f(tx).await
     }
 
-    /// Executes a SQL query directly.
+    /// Executes a SQL query directly against the pool, without acquiring the write-transaction
+    /// permit.
+    ///
+    /// square-tower fork addition (M4-24): this is the required path for read-only queries.
+    /// `begin`/`tx` serialise every caller behind a single semaphore permit and a `BEGIN
+    /// IMMEDIATE` write lock (M4-22) -- correct for writes, but a pure read taking that same
+    /// permit needlessly blocks every other write in the process behind it, capping throughput
+    /// on a slow/fsync-bound disk. Under WAL, `execute` (an ordinary pooled connection, no
+    /// transaction) reads the last-committed snapshot concurrently with a writer holding an open
+    /// `BEGIN IMMEDIATE` transaction, so it never contends for the write lock. Every read-only
+    /// method on this store (`resolve`, `get_latest_entry`, `get_log_heights`, `get_log_size`,
+    /// cursor reads, etc.) already goes through this method rather than `begin`/`tx` (audited
+    /// M4-24: the store's write-transaction call sites -- `forge.rs`, `node.rs`, the address
+    /// book actor, `acked.rs`'s cursor writes, `spaces/member.rs`, `spaces/space.rs` -- all
+    /// perform at least one write inside the transaction; none wrap a read-only body). Only use
+    /// `begin`/`tx` when the query needs to write, or needs read-then-write atomicity with a
+    /// write later in the same transaction (e.g. `get_latest_entry_tx` before `insert_operation`).
     pub async fn execute<F, R>(&self, f: F) -> Result<R, SqliteError>
     where
         F: AsyncFnOnce(&sqlx::SqlitePool) -> Result<R, SqliteError>,
@@ -391,6 +435,12 @@ impl crate::traits::Transaction for SqliteStore {
     ///
     /// It is usually not necessary to acquire a transaction when the logic only requires committed
     /// _reads_ to the database. Use `execute` instead.
+    ///
+    /// square-tower fork addition (M4-24): this is a hard rule, not just a recommendation --
+    /// `begin` serialises every caller in the process behind one semaphore permit plus a `BEGIN
+    /// IMMEDIATE` write-lock acquisition (M4-22), so a read-only caller taking it blocks every
+    /// concurrent writer (ingest, orderer, ack) for no reason. Reserve `begin`/`tx` for queries
+    /// that write, or that must read-then-write atomically within the same transaction.
     async fn begin(&self) -> Result<TransactionPermit, SqliteError> {
         // Acquire a permit from the semaphore, it will await if currently another process has the
         // permit. Here we enforce strict serialization of transactions (similar to what SQLite

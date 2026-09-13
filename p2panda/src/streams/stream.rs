@@ -217,6 +217,17 @@ where
                     // `StreamPublisher` and `StreamSubscription` have been dropped.
                     _ = cancellation_token_child.cancelled() => {
                         debug!(topic = %topic.to_hex(), "aborting output event processing task");
+                        // square-tower fork addition (M4-24): persist any batched-but-unpersisted
+                        // ack cursor immediately on a graceful shutdown of this stream, rather
+                        // than leaving it to the next process start's replay to rediscover --
+                        // see `Acked::flush`.
+                        if let Err(err) = acked.flush().await {
+                            warn!(
+                                topic = %topic.to_hex(),
+                                %err,
+                                "failed to flush batched ack cursor during shutdown"
+                            );
+                        }
                         break
                     }
                 };
