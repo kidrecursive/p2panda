@@ -193,6 +193,28 @@ where
                     // Handle resulting output events from the pipeline and forward them as stream
                     // events to application layer, when applicable.
                     from_pipeline_event = pipeline.next() => {
+                        // TEMPORARY DIAGNOSTIC (M4-24 controller round, 2026-09-13; REVERT BEFORE
+                        // MERGE): one line per pipeline output event, tagged with this node's id
+                        // and the op's hash/seq_num, plus each processor's `ProcessorStatus`
+                        // (ingest/orderer/log_prune/spaces) -- chasing
+                        // `retention.rs::peer_never_prunes_remote_log`'s CI-only
+                        // `received_ops: 16` vs `remote_heights[A]: 20` (4 ops never producing a
+                        // `Processed` event on node B), which the M4-22 ack-retry fix does not
+                        // cover. `debug!` under this crate's own target, so `RUST_LOG=p2panda=debug`
+                        // (already set by callers like `crates/node/tests/retention.rs`) surfaces
+                        // it without needing a new env var.
+                        debug!(
+                            node_id = %node_id.to_hex(),
+                            topic = %topic.to_hex(),
+                            hash = %from_pipeline_event.operation.hash,
+                            seq_num = %from_pipeline_event.operation.header.seq_num,
+                            ingest = ?from_pipeline_event.ingest,
+                            orderer = ?from_pipeline_event.orderer,
+                            log_prune = ?from_pipeline_event.log_prune,
+                            spaces = ?from_pipeline_event.spaces,
+                            "M4-24 DIAGNOSTIC: pipeline output event"
+                        );
+
                         if let Some(forward_events) =
                             process_operation_out::<M>(
                                 from_pipeline_event,
