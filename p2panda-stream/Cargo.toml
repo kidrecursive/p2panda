@@ -37,6 +37,8 @@ groups = [
 ]
 ingest = [
     "dep:indexmap",
+    "orderer",
+    "dep:serde",
 ]
 log_prune = []
 orderer = [
