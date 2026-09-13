@@ -47,7 +47,7 @@ use crate::traits::Protocol;
 pub struct TopicLogSync<T, S, L, E> {
     pub topic: T,
     pub store: S,
-    pub event_tx: broadcast::Sender<TopicLogSyncEvent<E>>,
+    pub event_tx: broadcast::Sender<TopicLogSyncEvent<L, E>>,
     pub live_mode_rx: Option<mpsc::Receiver<ToSync<Operation<E>>>>,
     pub buffer_capacity: usize,
     pub _phantom: PhantomData<L>,
@@ -70,7 +70,7 @@ where
         topic: T,
         store: S,
         live_mode_rx: Option<mpsc::Receiver<ToSync<Operation<E>>>>,
-        event_tx: broadcast::Sender<TopicLogSyncEvent<E>>,
+        event_tx: broadcast::Sender<TopicLogSyncEvent<L, E>>,
     ) -> Self {
         Self::new_with_capacity(
             topic,
@@ -86,7 +86,7 @@ where
         topic: T,
         store: S,
         live_mode_rx: Option<mpsc::Receiver<ToSync<Operation<E>>>>,
-        event_tx: broadcast::Sender<TopicLogSyncEvent<E>>,
+        event_tx: broadcast::Sender<TopicLogSyncEvent<L, E>>,
         buffer_capacity: usize,
     ) -> Self {
         Self {
@@ -133,6 +133,13 @@ where
             .resolve(&self.topic)
             .await
             .map_err(|err| TopicLogSyncError::TopicStore(err.to_string()))?;
+
+        // square-tower fork addition (D3-u, M4-21): publish the resolved log set as a baseline
+        // snapshot for this session so the topic manager can later detect drift (a differing
+        // resolved set) and replace only sessions whose baseline has gone stale.
+        self.event_tx
+            .send(TopicLogSyncEvent::LogsResolved { logs: logs.clone() })
+            .map_err(|_| TopicLogSyncChannelError::EventSend)?;
 
         if enabled!(Level::DEBUG) {
             let display_logs: BTreeMap<String, usize> =
@@ -484,11 +491,20 @@ impl From<LogSyncMetrics> for Metrics {
 
 /// Events emitted from topic log sync sessions.
 #[derive(Debug, Clone, PartialEq)]
-pub enum TopicLogSyncEvent<E = ()> {
+pub enum TopicLogSyncEvent<L, E = ()> {
     /// A session has been initiated locally.
     ///
     /// This event is always sent and will be followed by `SyncStarted` or `Failed` events.
     SessionStarted,
+
+    /// square-tower fork addition (D3-u, M4-21): the session has resolved its offered
+    /// (author, log) set for the topic. Emitted once, right after `TopicStore::resolve`, before
+    /// the log sync protocol itself runs. Used by `p2panda-net`'s topic manager as the baseline
+    /// snapshot to detect structural drift (a differing resolved set) for event-driven resync;
+    /// not part of the ordinary catch-up/live-mode event sequence consumed by application code.
+    LogsResolved {
+        logs: BTreeMap<VerifyingKey, Vec<L>>,
+    },
 
     /// We have exchanged initial session metrics with the remote and the sync phase of this session
     /// has started.
@@ -525,7 +541,7 @@ pub enum TopicLogSyncEvent<E = ()> {
     Failed { error: String },
 }
 
-impl<E> From<LogSyncEvent<E>> for TopicLogSyncEvent<E> {
+impl<L, E> From<LogSyncEvent<E>> for TopicLogSyncEvent<L, E> {
     fn from(event: LogSyncEvent<E>) -> Self {
         match event {
             LogSyncEvent::MetricsExchanged { metrics } => TopicLogSyncEvent::SyncStarted {
@@ -659,6 +675,10 @@ pub mod tests {
 
         std::assert_matches!(
             events_rx.recv().await.unwrap(),
+            TopicLogSyncEvent::LogsResolved { .. }
+        );
+        std::assert_matches!(
+            events_rx.recv().await.unwrap(),
             TopicLogSyncEvent::SyncStarted { .. }
         );
         std::assert_matches!(
@@ -715,6 +735,10 @@ pub mod tests {
         .await
         .unwrap();
 
+        std::assert_matches!(
+            events_rx.recv().await.unwrap(),
+            TopicLogSyncEvent::LogsResolved { .. }
+        );
         std::assert_matches!(
             events_rx.recv().await.unwrap(),
             TopicLogSyncEvent::SyncStarted { .. }
@@ -814,15 +838,17 @@ pub mod tests {
         let logs = BTreeMap::from([(peer_a.id(), vec![log_id])]);
         peer_a.associate(&topic, &logs).await;
 
-        let (peer_a_session, mut peer_a_events_rx, _) =
-            peer_a.topic_sync_protocol(topic, false);
+        let (peer_a_session, mut peer_a_events_rx, _) = peer_a.topic_sync_protocol(topic, false);
 
-        let (peer_b_session, mut peer_b_events_rx, _) =
-            peer_b.topic_sync_protocol(topic, false);
+        let (peer_b_session, mut peer_b_events_rx, _) = peer_b.topic_sync_protocol(topic, false);
 
         run_protocol(peer_a_session, peer_b_session).await.unwrap();
 
         // Assert peer a events.
+        std::assert_matches!(
+            peer_a_events_rx.recv().await.unwrap(),
+            TopicLogSyncEvent::LogsResolved { .. }
+        );
         std::assert_matches!(
             peer_a_events_rx.recv().await.unwrap(),
             TopicLogSyncEvent::SyncStarted { .. }
@@ -837,6 +863,10 @@ pub mod tests {
         );
 
         // Assert peer b events.
+        std::assert_matches!(
+            peer_b_events_rx.recv().await.unwrap(),
+            TopicLogSyncEvent::LogsResolved { .. }
+        );
         std::assert_matches!(
             peer_b_events_rx.recv().await.unwrap(),
             TopicLogSyncEvent::SyncStarted { .. }
@@ -906,8 +936,7 @@ pub mod tests {
         let (header_2, _) = peer_a.create_operation_no_insert(&body, log_id).await;
         let expected_bytes_sent = header_2.payload_size + header_2.size();
 
-        let (protocol, mut events_rx, mut live_mode_tx) =
-            peer_a.topic_sync_protocol(topic, true);
+        let (protocol, mut events_rx, mut live_mode_tx) = peer_a.topic_sync_protocol(topic, true);
 
         live_mode_tx
             .send(ToSync::Payload(Operation {
@@ -940,6 +969,10 @@ pub mod tests {
         .await
         .unwrap();
 
+        std::assert_matches!(
+            events_rx.recv().await.unwrap(),
+            TopicLogSyncEvent::LogsResolved { .. }
+        );
         std::assert_matches!(
             events_rx.recv().await.unwrap(),
             TopicLogSyncEvent::SyncStarted { .. }
@@ -1017,8 +1050,7 @@ pub mod tests {
         let (header_2, _) = peer_a.create_operation_no_insert(&body, log_id).await;
         let expected_bytes_sent = header_2.payload_size + header_2.size();
 
-        let (protocol, mut events_rx, mut live_mode_tx) =
-            peer_a.topic_sync_protocol(topic, true);
+        let (protocol, mut events_rx, mut live_mode_tx) = peer_a.topic_sync_protocol(topic, true);
 
         live_mode_tx
             .send(ToSync::Payload(Operation {
@@ -1066,6 +1098,10 @@ pub mod tests {
         .await
         .unwrap();
 
+        std::assert_matches!(
+            events_rx.recv().await.unwrap(),
+            TopicLogSyncEvent::LogsResolved { .. }
+        );
         std::assert_matches!(
             events_rx.recv().await.unwrap(),
             TopicLogSyncEvent::SyncStarted { .. }

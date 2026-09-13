@@ -2,10 +2,12 @@
 
 use std::collections::BTreeMap;
 
+use futures_util::stream::{Stream, StreamExt};
 use p2panda_core::cbor::{decode_cbor, encode_cbor};
 use p2panda_core::{LogId, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sqlx::{query, query_as, query_scalar};
+use tokio_stream::wrappers::BroadcastStream;
 
 use crate::sqlite::{DecodeError, SqliteError, SqliteStore};
 use crate::topics::TopicStore;
@@ -55,7 +57,22 @@ where
                 .map_err(SqliteError::Sqlite)
             })
             .await?;
-        Ok(result.rows_affected() > 0)
+        let is_new = result.rows_affected() > 0;
+
+        // square-tower fork addition (D3-u, M4-21): push a notification for every *new*
+        // association only -- re-associating an already-known (topic, author, data_id) triple is
+        // a no-op and must not fire (see `associate_sends_notification_only_when_new`). This is
+        // the sole real association choke point, so it's the correct place to detect drift for
+        // event-driven resync without waiting for the periodic timer.
+        if is_new {
+            let encoded_topic =
+                encode_cbor(&topic).map_err(|err| SqliteError::Encode("topic".to_string(), err))?;
+            // A lagged/no-receiver broadcast send is non-fatal: the next real association or the
+            // resync timer fallback still catches it (see docs/upstream write-up).
+            let _ = self.assoc_tx.send(encoded_topic);
+        }
+
+        Ok(is_new)
     }
 
     /// Remove an association between a topic and author + log id pair.
@@ -204,5 +221,23 @@ where
         }
 
         Ok(result)
+    }
+
+    /// square-tower fork addition (D3-u, M4-21): push notifications for new associations made
+    /// for this specific topic, filtered from the store-wide `assoc_tx` broadcast channel by
+    /// comparing encoded topic bytes. A `Lagged` receiver error is dropped (non-fatal, see
+    /// `associate`'s doc comment) rather than ending the stream.
+    fn subscribe_new_associations(
+        &self,
+        topic: &T,
+    ) -> impl Stream<Item = ()> + Send + Unpin + 'static {
+        let encoded_topic = encode_cbor(&topic).ok();
+        let rx = self.assoc_tx.subscribe();
+        BroadcastStream::new(rx).filter_map(move |item| {
+            futures_util::future::ready(match (item, &encoded_topic) {
+                (Ok(bytes), Some(encoded_topic)) if bytes == *encoded_topic => Some(()),
+                _ => None,
+            })
+        })
     }
 }

@@ -55,7 +55,7 @@ async fn modular_api() {
         .unwrap();
 
     let handle = sync.stream([1; 32].into(), true).await.unwrap();
-    let mut rx: SyncSubscription<TopicLogSyncEvent<()>> = handle.subscribe().await.unwrap();
+    let mut rx: SyncSubscription<TopicLogSyncEvent<u64, ()>> = handle.subscribe().await.unwrap();
 
     tokio::spawn(async move {
         while let Some(_event) = rx.next().await {

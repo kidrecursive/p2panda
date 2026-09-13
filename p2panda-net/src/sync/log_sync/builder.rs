@@ -22,7 +22,7 @@ where
         + Clone
         + Send
         + 'static,
-    L: LogId + Debug + Send + 'static,
+    L: LogId + Debug + Send + Sync + 'static,
     E: Extensions + Send + 'static,
 {
     store: S,
@@ -39,7 +39,7 @@ where
         + Clone
         + Send
         + 'static,
-    L: LogId + Debug + Send + 'static,
+    L: LogId + Debug + Send + Sync + 'static,
     E: Extensions + Send + 'static,
 {
     pub fn new(store: S, endpoint: Endpoint, gossip: Gossip) -> Self {
@@ -58,7 +58,7 @@ where
         self
     }
 
-    pub async fn spawn(self) -> Result<LogSync<S, L, E>, LogSyncError<E>> {
+    pub async fn spawn(self) -> Result<LogSync<S, L, E>, LogSyncError<L, E>> {
         let (actor_ref, _) = {
             let thread_pool = ThreadLocalActorSpawner::new();
 

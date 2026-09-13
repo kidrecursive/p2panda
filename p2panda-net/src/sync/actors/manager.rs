@@ -113,6 +113,7 @@ impl<T> Default for TopicManagers<T> {
 pub struct SyncManagerState<M>
 where
     M: SyncManagerTrait<Topic> + Send + 'static,
+    M::LogId: Send + Sync + 'static,
 {
     protocol_id: ProtocolId,
     endpoint: Endpoint,
@@ -129,6 +130,7 @@ where
 impl<M> SyncManagerState<M>
 where
     M: SyncManagerTrait<Topic> + Send + 'static,
+    M::LogId: Send + Sync + 'static,
 {
     /// Drop all internal state associated with the given topic.
     fn drop_topic_state(&mut self, topic: &Topic) {
@@ -241,6 +243,7 @@ impl<M> Default for SyncManager<M> {
 impl<M> ThreadLocalActor for SyncManager<M>
 where
     M: SyncManagerTrait<Topic> + Send + 'static,
+    M::LogId: Send + Sync + 'static,
 {
     type State = SyncManagerState<M>;
 

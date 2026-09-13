@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::time::Duration;
 
 use futures_channel::mpsc::{self, SendError};
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
-use p2panda_core::Topic;
 use p2panda_core::test_utils::setup_logging;
+use p2panda_core::{SigningKey, Topic, VerifyingKey};
 use p2panda_sync::traits::{Manager as SyncManagerTrait, Protocol};
 use p2panda_sync::{FromSync, ToSync};
 use ractor::thread_local::{ThreadLocalActor, ThreadLocalActorSpawner};
@@ -205,6 +206,7 @@ impl SyncManagerTrait<Topic> for DummySyncManager<FailingSyncArgs, FailingSyncPr
     type Args = FailingSyncArgs;
     type Message = DummySyncMessage;
     type Error = SendError;
+    type LogId = ();
 
     fn from_args(args: Self::Args) -> Self {
         let event_rx = args.event_tx.subscribe();
@@ -214,6 +216,28 @@ impl SyncManagerTrait<Topic> for DummySyncManager<FailingSyncArgs, FailingSyncPr
             args,
             _marker: PhantomData,
         }
+    }
+
+    // square-tower fork addition (D3-u, M4-21): this harness tests `Resync`'s session-lifecycle
+    // mechanics (pending-resync bookkeeping, gossip races, authoriser re-checks) -- D3-u's
+    // structural drift detection is exercised separately, against the real `TopicStore`/`Manager`
+    // implementations, by `p2panda-store`/`p2panda-sync`/`p2panda-net`'s own new tests. So every
+    // `Resync` call here must be unconditionally "stale" (matching the pre-D3-u blind-replace
+    // behaviour these tests were written against): `resolved_logs_from_event` below always
+    // reports an empty baseline, and this always reports a non-empty snapshot, so the two never
+    // compare equal.
+    async fn resolved_logs(&self, _topic: &Topic) -> BTreeMap<VerifyingKey, Vec<Self::LogId>> {
+        BTreeMap::from([(SigningKey::from_bytes(&[7; 32]).verifying_key(), vec![()])])
+    }
+
+    /// square-tower fork addition (D3-u, M4-21): see `resolved_logs`'s doc comment -- always
+    /// reports an (empty) baseline so every session here is treated as having resolved one,
+    /// making `Resync`'s structural check unconditionally stale (this harness's sessions never
+    /// emit a real `LogsResolved`-equivalent event).
+    fn resolved_logs_from_event(
+        _event: &Self::Event,
+    ) -> Option<BTreeMap<VerifyingKey, Vec<Self::LogId>>> {
+        Some(BTreeMap::new())
     }
 
     async fn session(

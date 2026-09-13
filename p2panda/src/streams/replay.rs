@@ -54,7 +54,7 @@ pub(crate) async fn replay_log_ranges<M>(
     store: &SqliteStore,
     to_output_tx: &mpsc::Sender<Vec<ForwardEvent<M>>>,
     pipeline: &Pipeline<LogId, Extensions, Topic>,
-    sync_handle: &Arc<SyncHandle<Operation, TopicLogSyncEvent<Extensions>>>,
+    sync_handle: &Arc<SyncHandle<Operation, TopicLogSyncEvent<Topic, Extensions>>>,
     ranges: LogRanges<VerifyingKey, LogId>,
 ) -> Result<(), ReplayError>
 where

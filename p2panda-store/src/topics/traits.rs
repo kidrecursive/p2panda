@@ -3,6 +3,8 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 
+use futures_util::stream::{self, Stream};
+
 /// Maps a topic to a user-defined data type being sent over the wire during sync.
 ///
 /// It defines the type of data it is expecting to sync and how the scope for a particular session
@@ -69,4 +71,18 @@ pub trait TopicStore<T, A, D> {
 
     /// Retrieve all topics for which active associations exist.
     fn topics(&self) -> impl Future<Output = Result<Vec<T>, Self::Error>>;
+
+    /// square-tower fork addition (D3-u, M4-21): a push notification stream that yields once for
+    /// every *new* association made for this topic (via `associate`'s `is_new` case), so callers
+    /// can react to changed association state without waiting for a poll/timer. The default
+    /// implementation yields nothing -- implementers that can't push (e.g. purely in-memory
+    /// stores without a broadcast channel) still satisfy the trait, callers relying on this must
+    /// fall back to a timer for those.
+    fn subscribe_new_associations(
+        &self,
+        topic: &T,
+    ) -> impl Stream<Item = ()> + Send + Unpin + 'static {
+        let _ = topic;
+        stream::empty()
+    }
 }

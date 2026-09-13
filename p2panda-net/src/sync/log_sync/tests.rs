@@ -57,6 +57,15 @@ async fn e2e_log_sync() {
         event,
         Ok(FromSync {
             session_id: 0,
+            event: Event::LogsResolved { .. },
+            ..
+        })
+    );
+    let event = alice_subscription.next().await.unwrap();
+    std::assert_matches!(
+        event,
+        Ok(FromSync {
+            session_id: 0,
             remote,
             event: Event::SyncStarted { .. },
         }) if remote == bob_id
@@ -88,6 +97,15 @@ async fn e2e_log_sync() {
 
     // Assert Bob receives the expected events.
     let alice_id = alice.node_id();
+    let event = bob_subscription.next().await.unwrap();
+    std::assert_matches!(
+        event,
+        Ok(FromSync {
+            session_id: 0,
+            event: Event::LogsResolved { .. },
+            ..
+        })
+    );
     let event = bob_subscription.next().await.unwrap();
     std::assert_matches!(
         event,
@@ -216,6 +234,15 @@ async fn e2e_three_party_sync() {
         event,
         Ok(FromSync {
             session_id: 0,
+            event: Event::LogsResolved { .. },
+            ..
+        })
+    );
+    let event = alice_subscription.next().await.unwrap();
+    std::assert_matches!(
+        event,
+        Ok(FromSync {
+            session_id: 0,
             remote,
             event: Event::SyncStarted { .. },
         }) if remote == bob_id
@@ -247,6 +274,15 @@ async fn e2e_three_party_sync() {
 
     // Assert Bob receives the expected events.
     let alice_id = alice.node_id();
+    let event = bob_subscription.next().await.unwrap();
+    std::assert_matches!(
+        event,
+        Ok(FromSync {
+            session_id: 0,
+            event: Event::LogsResolved { .. },
+            ..
+        })
+    );
     let event = bob_subscription.next().await.unwrap();
     std::assert_matches!(
         event,
@@ -310,6 +346,15 @@ async fn e2e_three_party_sync() {
 
     carol_handle.initiate_session(alice.node_id());
 
+    let event = carol_subscription.next().await.unwrap();
+    std::assert_matches!(
+        event,
+        Ok(FromSync {
+            session_id: 0,
+            event: Event::LogsResolved { .. },
+            ..
+        })
+    );
     let event = carol_subscription.next().await.unwrap();
     std::assert_matches!(
         event,
@@ -434,8 +479,11 @@ async fn resync_replaces_live_session_recovering_late_association() {
         )
         .await;
 
-    // The periodic resync (what this test stands in for) replaces the live session.
-    alice_handle.resync(bob.node_id());
+    // square-tower fork addition (D3-u, M4-21): no explicit `resync()` call -- the association
+    // above pushes an `AssociationChanged` notification to alice's topic manager (via
+    // `Manager::subscribe_new_associations`), which structurally compares the fresh resolved log
+    // set against the live session's `LogsResolved` baseline and replaces it on its own, without
+    // waiting for `sync.resync_interval`'s timer.
 
     // Bob must see the new log's operation delivered by the fresh session's ordinary log-diff
     // catch-up.
@@ -443,9 +491,10 @@ async fn resync_replaces_live_session_recovering_late_association() {
         loop {
             let event = bob_subscription.next().await.unwrap().unwrap();
             if let Event::OperationReceived { operation, .. } = event.event
-                && operation.hash == new_header.hash() {
-                    return;
-                }
+                && operation.hash == new_header.hash()
+            {
+                return;
+            }
         }
     })
     .await;
@@ -540,4 +589,179 @@ async fn panic_on_sink_closure_after_error_regression() {
     connection.close(0u32.into(), b"testing");
     let result = handle.await.unwrap();
     assert!(result.is_err());
+}
+
+/// square-tower fork addition (D3-u, M4-21): a session whose own `LogsResolved` baseline already
+/// matches the topic's current resolved set must never be replaced by `Resync`, even when another
+/// peer's stale session (baseline captured before a later association) legitimately is -- the
+/// structural (`!=`) comparison is per-session, not "replace everyone whenever anything changed".
+///
+/// Mutation-proof: dropping the `!=` filter in `TopicManager::handle`'s `Resync` arm (replacing
+/// every current session unconditionally, as D3-s did) makes carol's explicit resync also produce
+/// a new session, failing the final assertion.
+#[tokio::test]
+async fn association_change_replaces_only_stale_session() {
+    setup_logging();
+
+    let topic: Topic = [91; 32].into();
+    let existing_log_id = 0;
+    let new_log_id = 1;
+
+    let mut bob = TestNode::spawn([82; 32], None).await;
+    let mut alice = TestNode::spawn([83; 32], Some(bob.node_info())).await;
+    let carol = TestNode::spawn([84; 32], Some(alice.node_info())).await;
+
+    alice
+        .client
+        .create_operation(b"alice's first log", existing_log_id)
+        .await;
+    alice
+        .client
+        .associate(
+            &topic,
+            &HashMap::from([(alice.client_id(), vec![existing_log_id])]),
+        )
+        .await;
+
+    let alice_handle = alice.log_sync.stream(topic, true).await.unwrap();
+    let mut alice_subscription = alice_handle.subscribe().await.unwrap();
+
+    let bob_handle = bob.log_sync.stream(topic, true).await.unwrap();
+    let _bob_subscription = bob_handle.subscribe().await.unwrap();
+
+    alice_handle.initiate_session(bob.node_id());
+
+    // Drain alice's session with bob through to live mode -- its `LogsResolved` baseline is now
+    // frozen at `{existing_log_id}`.
+    let bob_session_id = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let event = alice_subscription.next().await.unwrap().unwrap();
+            if event.session_id == 0 && matches!(event.event, Event::LiveModeStarted) {
+                return event.session_id;
+            }
+        }
+    })
+    .await
+    .expect("bob's first session should reach live mode");
+
+    // A NEW log is associated *after* bob's session resolved -- this must replace his now-stale
+    // session automatically (event-driven resync, no explicit `resync()` call).
+    alice
+        .client
+        .create_operation(b"alice's new log", new_log_id)
+        .await;
+    alice
+        .client
+        .associate(
+            &topic,
+            &HashMap::from([(alice.client_id(), vec![new_log_id])]),
+        )
+        .await;
+
+    let new_bob_session_id = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let event = alice_subscription.next().await.unwrap().unwrap();
+            if event.session_id != bob_session_id
+                && matches!(event.event, Event::SyncStarted { .. })
+            {
+                return event.session_id;
+            }
+        }
+    })
+    .await
+    .expect("bob's stale session must be replaced with a fresh one");
+    assert_ne!(new_bob_session_id, bob_session_id);
+
+    // Carol connects *after* the new log was already associated -- her session's own
+    // `LogsResolved` baseline already includes it, so she must never be treated as stale.
+    let carol_handle = carol.log_sync.stream(topic, true).await.unwrap();
+    let mut carol_subscription = carol_handle.subscribe().await.unwrap();
+    carol_handle.initiate_session(alice.node_id());
+
+    let carol_session_id = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let event = carol_subscription.next().await.unwrap().unwrap();
+            if matches!(event.event, Event::LiveModeStarted) {
+                return event.session_id;
+            }
+        }
+    })
+    .await
+    .expect("carol's session should reach live mode");
+
+    // An explicit resync (what the periodic timer sends every `sync.resync_interval`) must be a
+    // no-op for carol's already-fresh session.
+    alice_handle.resync(carol.node_id());
+    let no_replacement = tokio::time::timeout(Duration::from_millis(800), async {
+        loop {
+            let event = carol_subscription.next().await.unwrap().unwrap();
+            if event.session_id != carol_session_id {
+                return event.session_id;
+            }
+        }
+    })
+    .await;
+    assert!(
+        no_replacement.is_err(),
+        "carol's already-fresh session must not be replaced, but got: {no_replacement:?}"
+    );
+}
+
+/// square-tower fork addition (D3-u, M4-21): calling `Resync` directly (what the periodic
+/// `sync.resync_interval` timer does) with no association change since the session's own
+/// `LogsResolved` baseline was captured must be a no-op -- the timer becomes a redundant fallback
+/// once nothing has actually changed.
+///
+/// Mutation-proof: dropping the `!=` filter in `TopicManager::handle`'s `Resync` arm (replacing
+/// the session unconditionally) makes the final assertion fail (a new session appears).
+#[tokio::test]
+async fn resync_timer_noop_when_unchanged() {
+    setup_logging();
+
+    let topic: Topic = [92; 32].into();
+    let log_id = 0;
+
+    let mut bob = TestNode::spawn([85; 32], None).await;
+    let mut alice = TestNode::spawn([86; 32], Some(bob.node_info())).await;
+
+    alice.client.create_operation(b"alice's log", log_id).await;
+    alice
+        .client
+        .associate(&topic, &HashMap::from([(alice.client_id(), vec![log_id])]))
+        .await;
+
+    let alice_handle = alice.log_sync.stream(topic, true).await.unwrap();
+    let mut alice_subscription = alice_handle.subscribe().await.unwrap();
+
+    let bob_handle = bob.log_sync.stream(topic, true).await.unwrap();
+    let _bob_subscription = bob_handle.subscribe().await.unwrap();
+
+    alice_handle.initiate_session(bob.node_id());
+
+    let session_id = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let event = alice_subscription.next().await.unwrap().unwrap();
+            if matches!(event.event, Event::LiveModeStarted) {
+                return event.session_id;
+            }
+        }
+    })
+    .await
+    .expect("session should reach live mode");
+
+    // No association changed since the session's own baseline was captured.
+    alice_handle.resync(bob.node_id());
+    let no_replacement = tokio::time::timeout(Duration::from_millis(800), async {
+        loop {
+            let event = alice_subscription.next().await.unwrap().unwrap();
+            if event.session_id != session_id {
+                return event.session_id;
+            }
+        }
+    })
+    .await;
+    assert!(
+        no_replacement.is_err(),
+        "an unchanged log set must not be replaced, but got: {no_replacement:?}"
+    );
 }

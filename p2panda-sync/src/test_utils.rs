@@ -35,7 +35,7 @@ pub type TestLogSyncError = LogSyncError;
 
 // Types used in topic log sync protocol tests.
 pub type TestTopicSyncMessage = TopicLogSyncMessage<TestLogId>;
-pub type TestTopicSyncEvent = TopicLogSyncEvent<TestExtensions>;
+pub type TestTopicSyncEvent = TopicLogSyncEvent<TestLogId, TestExtensions>;
 pub type TestTopicSync = TopicLogSync<Topic, SqliteStore, TestLogId, TestExtensions>;
 pub type TestTopicSyncError = TopicLogSyncError;
 pub type TestTopicSyncManager = TopicSyncManager<Topic, SqliteStore, TestLogId, TestExtensions>;

@@ -40,9 +40,9 @@ impl Aggregator {
 
     /// Process a `TopicLogSyncEvent`, collect metrics and calculate aggregates and return
     /// enriched aggregate event types.
-    pub fn process<E: Extensions>(
+    pub fn process<L, E: Extensions>(
         &mut self,
-        from_sync: FromSync<TopicLogSyncEvent<E>>,
+        from_sync: FromSync<TopicLogSyncEvent<L, E>>,
     ) -> Option<SyncEvent<E>> {
         let FromSync {
             session_id,
@@ -52,6 +52,10 @@ impl Aggregator {
         } = from_sync;
 
         match event {
+            // square-tower fork addition (D3-u, M4-21): a session's resolved-log baseline
+            // snapshot, used by `p2panda-net`'s topic manager for event-driven resync. Not part
+            // of the metrics aggregation this type tracks -- no aggregate event is produced.
+            TopicLogSyncEvent::LogsResolved { .. } => None,
             TopicLogSyncEvent::SessionStarted => {
                 self.running_sessions += 1;
                 // Insert default metrics into the session metrics map for now, these will be

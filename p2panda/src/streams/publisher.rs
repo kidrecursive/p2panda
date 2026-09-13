@@ -104,7 +104,7 @@ pub(crate) type ToOutputTx<M> = mpsc::Sender<Vec<ForwardEvent<M>>>;
 pub struct StreamPublisher<M> {
     topic: Topic,
     forge: OperationForge,
-    sync_handle: Arc<SyncHandle<Operation, TopicLogSyncEvent<Extensions>>>,
+    sync_handle: Arc<SyncHandle<Operation, TopicLogSyncEvent<Topic, Extensions>>>,
     pub(crate) publish_tx: PublishTx<M>,
     import_external_tx: ImportExternalTx,
     pub(crate) import_local_tx: ImportLocalTx,
@@ -121,7 +121,7 @@ where
     pub fn new(
         topic: Topic,
         forge: OperationForge,
-        sync_handle: Arc<SyncHandle<Operation, TopicLogSyncEvent<Extensions>>>,
+        sync_handle: Arc<SyncHandle<Operation, TopicLogSyncEvent<Topic, Extensions>>>,
         publish_tx: PublishTx<M>,
         import_external_tx: ImportExternalTx,
         import_local_tx: ImportLocalTx,

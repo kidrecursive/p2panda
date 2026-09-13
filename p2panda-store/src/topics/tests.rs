@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
+use futures_util::StreamExt;
 use p2panda_core::{SigningKey, Topic, VerifyingKey};
 
 use crate::topics::TopicStore;
@@ -206,4 +208,50 @@ async fn query_associated_topics() {
     for topic in expected_topics {
         assert!(topics.contains(&topic));
     }
+}
+
+/// square-tower fork addition (D3-u, M4-21): `associate`'s `is_new` case must push exactly one
+/// notification on `subscribe_new_associations` -- re-associating an already-known
+/// (topic, author, data_id) triple must not fire a second one. This is the sole real association
+/// choke point event-driven resync relies on to detect drift without waiting for the resync
+/// timer.
+///
+/// Mutation-proof: dropping the `is_new` guard around the `assoc_tx.send` call in
+/// `associate` (i.e. notifying unconditionally) makes the "no duplicate notification" assertion
+/// below fail.
+#[tokio::test]
+async fn associate_sends_notification_only_when_new() {
+    let store = SqliteStore::temporary().await;
+
+    let topic = Topic::random();
+    let log_id = topic;
+    let alice = SigningKey::from_bytes(&[1u8; 32]).verifying_key();
+
+    let mut new_associations =
+        <SqliteStore as TopicStore<Topic, VerifyingKey, Topic>>::subscribe_new_associations(
+            &store, &topic,
+        );
+
+    let permit = store.begin().await.unwrap();
+    let result = store.associate(&topic, &alice, &log_id).await.unwrap();
+    store.commit(permit).await.unwrap();
+    assert!(result, "first association must be new");
+
+    tokio::time::timeout(Duration::from_millis(200), new_associations.next())
+        .await
+        .expect("a new association must notify within 200ms")
+        .expect("stream must not have ended");
+
+    // Re-associating the exact same (topic, author, data_id) triple is not new.
+    let permit = store.begin().await.unwrap();
+    let result = store.associate(&topic, &alice, &log_id).await.unwrap();
+    store.commit(permit).await.unwrap();
+    assert!(!result, "re-association of the same triple must not be new");
+
+    let no_duplicate =
+        tokio::time::timeout(Duration::from_millis(200), new_associations.next()).await;
+    assert!(
+        no_duplicate.is_err(),
+        "re-associating an already-known triple must not notify again, but got: {no_duplicate:?}"
+    );
 }

@@ -45,20 +45,21 @@ where
         + Clone
         + Send
         + 'static,
-    L: LogId + Debug + Send + 'static,
+    L: LogId + Debug + Send + Sync + 'static,
     E: Extensions + Send + 'static,
 {
-    inner: Arc<RwLock<Inner<E>>>,
+    inner: Arc<RwLock<Inner<L, E>>>,
     _phantom: PhantomData<(S, L)>,
 }
 
 #[derive(Debug)]
-struct Inner<E>
+struct Inner<L, E>
 where
+    L: LogId + Debug + Send + Sync + 'static,
     E: Extensions + Send + 'static,
 {
     #[allow(clippy::type_complexity)]
-    actor_ref: ActorRef<ToSyncManager<Operation<E>, TopicLogSyncEvent<E>>>,
+    actor_ref: ActorRef<ToSyncManager<Operation<E>, TopicLogSyncEvent<L, E>>>,
 }
 
 impl<S, L, E> LogSync<S, L, E>
@@ -68,12 +69,12 @@ where
         + Clone
         + Send
         + 'static,
-    L: LogId + Debug + Send + 'static,
+    L: LogId + Debug + Send + Sync + 'static,
     E: Extensions + Send + 'static,
 {
     #[allow(clippy::type_complexity)]
     pub(crate) fn new(
-        actor_ref: ActorRef<ToSyncManager<Operation<E>, TopicLogSyncEvent<E>>>,
+        actor_ref: ActorRef<ToSyncManager<Operation<E>, TopicLogSyncEvent<L, E>>>,
     ) -> Self {
         Self {
             inner: Arc::new(RwLock::new(Inner { actor_ref })),
@@ -90,7 +91,7 @@ where
         &self,
         topic: Topic,
         live_mode: bool,
-    ) -> Result<SyncHandle<Operation<E>, TopicLogSyncEvent<E>>, LogSyncError<E>> {
+    ) -> Result<SyncHandle<Operation<E>, TopicLogSyncEvent<L, E>>, LogSyncError<L, E>> {
         let inner = self.inner.read().await;
         let sync_manager_ref =
             call!(inner.actor_ref, ToSyncManager::Create, topic, live_mode).map_err(Box::new)?;
@@ -103,8 +104,9 @@ where
     }
 }
 
-impl<E> Drop for Inner<E>
+impl<L, E> Drop for Inner<L, E>
 where
+    L: LogId + Debug + Send + Sync + 'static,
     E: Extensions + Send + 'static,
 {
     fn drop(&mut self) {
@@ -113,12 +115,13 @@ where
 }
 
 #[derive(Debug, Error)]
-pub enum LogSyncError<E> {
+#[allow(clippy::type_complexity)]
+pub enum LogSyncError<L, E> {
     /// Spawning the internal actor failed.
     #[error(transparent)]
     ActorSpawn(#[from] ractor::SpawnErr),
 
     /// Messaging with internal actor via RPC failed.
     #[error(transparent)]
-    ActorRpc(#[from] Box<ractor::RactorErr<ToSyncManager<Operation<E>, TopicLogSyncEvent<E>>>>),
+    ActorRpc(#[from] Box<ractor::RactorErr<ToSyncManager<Operation<E>, TopicLogSyncEvent<L, E>>>>),
 }

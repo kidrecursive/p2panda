@@ -7,7 +7,7 @@
 mod event_stream;
 mod session_map;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
 use std::hash::Hash as StdHash;
 use std::marker::PhantomData;
@@ -61,32 +61,35 @@ pub type ToTopicSync<E> = ToSync<Operation<E>>;
 pub struct TopicSyncManager<T, S, L, E>
 where
     T: Clone,
+    L: LogId,
     E: Extensions,
 {
     store: S,
     session_topic_map: SessionTopicMap<T, mpsc::Sender<ToTopicSync<E>>>,
-    from_session_tx: HashMap<(u64, VerifyingKey), broadcast::Sender<TopicLogSyncEvent<E>>>,
-    from_session_rx: HashMap<(u64, VerifyingKey), broadcast::Receiver<TopicLogSyncEvent<E>>>,
-    manager_tx: Vec<mpsc::Sender<SessionStream<T, E>>>,
+    from_session_tx: HashMap<(u64, VerifyingKey), broadcast::Sender<TopicLogSyncEvent<L, E>>>,
+    from_session_rx: HashMap<(u64, VerifyingKey), broadcast::Receiver<TopicLogSyncEvent<L, E>>>,
+    manager_tx: Vec<mpsc::Sender<SessionStream<T, L, E>>>,
     _phantom: PhantomData<L>,
 }
 
 #[derive(Debug)]
-pub(crate) struct SessionStream<T, E>
+pub(crate) struct SessionStream<T, L, E>
 where
     T: Clone,
+    L: LogId,
     E: Clone,
 {
     pub session_id: u64,
     pub topic: T,
     pub remote: VerifyingKey,
-    pub event_rx: broadcast::Receiver<TopicLogSyncEvent<E>>,
+    pub event_rx: broadcast::Receiver<TopicLogSyncEvent<L, E>>,
     pub live_tx: mpsc::Sender<ToTopicSync<E>>,
 }
 
 impl<T, S, L, E> TopicSyncManager<T, S, L, E>
 where
     T: Clone,
+    L: LogId,
     E: Extensions,
 {
     pub fn new(store: S) -> Self {
@@ -109,18 +112,44 @@ where
         + Clone
         + Send
         + 'static,
-    L: LogId + Debug + Send + 'static,
+    L: LogId + Debug + PartialEq + Clone + Send + 'static,
     E: Extensions + Send + 'static,
 {
     type Protocol = TopicLogSync<T, S, L, E>;
     type Args = S;
-    type Event = TopicLogSyncEvent<E>;
+    type Event = TopicLogSyncEvent<L, E>;
     type Message = Operation<E>;
     type Error = TopicSyncManagerError;
+    type LogId = L;
 
     /// Instantiate a manager from arguments.
     fn from_args(store: Self::Args) -> Self {
         Self::new(store)
+    }
+
+    /// square-tower fork addition (D3-u, M4-21): resolve the topic's current (author, log) set
+    /// directly from the store, defaulting to empty on error (mirrors the store-error handling
+    /// already used for the equivalent "not yet caught up" case elsewhere in this crate).
+    async fn resolved_logs(&self, topic: &T) -> BTreeMap<VerifyingKey, Vec<L>> {
+        self.store.resolve(topic).await.unwrap_or_default()
+    }
+
+    /// square-tower fork addition (D3-u, M4-21): delegate directly to the store's own push
+    /// notification stream.
+    fn subscribe_new_associations(
+        &self,
+        topic: &T,
+    ) -> impl Stream<Item = ()> + Send + Unpin + 'static {
+        self.store.subscribe_new_associations(topic)
+    }
+
+    /// square-tower fork addition (D3-u, M4-21): recognise this manager's own `LogsResolved`
+    /// event and extract its snapshot.
+    fn resolved_logs_from_event(event: &Self::Event) -> Option<BTreeMap<VerifyingKey, Vec<L>>> {
+        match event {
+            TopicLogSyncEvent::LogsResolved { logs } => Some(logs.clone()),
+            _ => None,
+        }
     }
 
     /// Instantiate a new sync session.
@@ -194,9 +223,9 @@ where
 
             #[allow(clippy::type_complexity)]
             let stream: Pin<
-                Box<dyn StreamDebug<Option<FromSync<TopicLogSyncEvent<E>>>>>,
+                Box<dyn StreamDebug<Option<FromSync<TopicLogSyncEvent<L, E>>>>>,
             > = Box::pin(stream.map(Box::new(
-                move |event: Result<TopicLogSyncEvent<E>, BroadcastStreamRecvError>| {
+                move |event: Result<TopicLogSyncEvent<L, E>, BroadcastStreamRecvError>| {
                     event.ok().map(|event| FromSync {
                         session_id,
                         remote,
@@ -252,6 +281,7 @@ mod tests {
     use p2panda_core::test_utils::setup_logging;
     use p2panda_core::{Body, Operation, Topic};
     use p2panda_store::SqliteStore;
+    use p2panda_store::topics::TopicStore;
 
     use crate::protocols::TopicLogSyncEvent;
     use crate::test_utils::{Peer, TestLogId, TestTopicSyncManager, drain_stream, run_protocol};
@@ -322,39 +352,49 @@ mod tests {
         run_protocol(peer_a_session, peer_b_session).await.unwrap();
 
         // Assert Peer A's events.
-        for index in 0..=4 {
+        // square-tower fork addition (D3-u, M4-21): a `LogsResolved` event now precedes
+        // `SyncStarted` as the session's very first event (its resolved-log baseline snapshot),
+        // shifting this from a 5-event to a 6-event sequence.
+        for index in 0..=5 {
             let event = event_stream_a.next().await.unwrap();
             assert_eq!(event.session_id(), 0);
             match index {
                 0 => std::assert_matches!(
                     event,
                     FromSync {
-                        event: TopicLogSyncEvent::SyncStarted { .. },
+                        event: TopicLogSyncEvent::LogsResolved { .. },
                         ..
                     }
                 ),
                 1 => std::assert_matches!(
                     event,
                     FromSync {
-                        event: TopicLogSyncEvent::OperationReceived { .. },
+                        event: TopicLogSyncEvent::SyncStarted { .. },
                         ..
                     }
                 ),
                 2 => std::assert_matches!(
                     event,
                     FromSync {
-                        event: TopicLogSyncEvent::SyncFinished { .. },
+                        event: TopicLogSyncEvent::OperationReceived { .. },
                         ..
                     }
                 ),
                 3 => std::assert_matches!(
                     event,
                     FromSync {
-                        event: TopicLogSyncEvent::LiveModeStarted,
+                        event: TopicLogSyncEvent::SyncFinished { .. },
                         ..
                     }
                 ),
                 4 => std::assert_matches!(
+                    event,
+                    FromSync {
+                        event: TopicLogSyncEvent::LiveModeStarted,
+                        ..
+                    }
+                ),
+                5 => std::assert_matches!(
                     event,
                     FromSync {
                         event: TopicLogSyncEvent::SessionFinished { .. },
@@ -366,14 +406,14 @@ mod tests {
         }
 
         // Assert Peer B's events.
-        for index in 0..=5 {
+        for index in 0..=6 {
             let event = event_stream_b.next().await.unwrap();
             match index {
                 0 => std::assert_matches!(
                     event,
                     FromSync {
                         session_id: 0,
-                        event: TopicLogSyncEvent::SyncStarted { .. },
+                        event: TopicLogSyncEvent::LogsResolved { .. },
                         ..
                     }
                 ),
@@ -381,7 +421,7 @@ mod tests {
                     event,
                     FromSync {
                         session_id: 0,
-                        event: TopicLogSyncEvent::OperationReceived { .. },
+                        event: TopicLogSyncEvent::SyncStarted { .. },
                         ..
                     }
                 ),
@@ -389,18 +429,26 @@ mod tests {
                     event,
                     FromSync {
                         session_id: 0,
-                        event: TopicLogSyncEvent::SyncFinished { .. },
+                        event: TopicLogSyncEvent::OperationReceived { .. },
                         ..
                     }
                 ),
                 3 => std::assert_matches!(
                     event,
                     FromSync {
-                        event: TopicLogSyncEvent::LiveModeStarted,
+                        session_id: 0,
+                        event: TopicLogSyncEvent::SyncFinished { .. },
                         ..
                     }
                 ),
                 4 => std::assert_matches!(
+                    event,
+                    FromSync {
+                        event: TopicLogSyncEvent::LiveModeStarted,
+                        ..
+                    }
+                ),
+                5 => std::assert_matches!(
                     event,
                     FromSync {
                         session_id: 0,
@@ -408,7 +456,7 @@ mod tests {
                         ..
                     }
                 ),
-                5 => std::assert_matches!(
+                6 => std::assert_matches!(
                     event,
                     FromSync {
                         event: TopicLogSyncEvent::SessionFinished { .. },
@@ -664,15 +712,17 @@ mod tests {
         run_protocol(peer_a_session, peer_b_session).await.unwrap();
 
         // Assert Peer B's events.
+        // square-tower fork addition (D3-u, M4-21): `LogsResolved` now precedes `SyncStarted`,
+        // shifting this from a 6-event to a 7-event sequence.
         let events = drain_stream(event_stream);
-        assert_eq!(events.len(), 6);
+        assert_eq!(events.len(), 7);
         for (index, event) in events.into_iter().enumerate() {
             match index {
                 0 => std::assert_matches!(
                     event,
                     FromSync {
                         session_id: 0,
-                        event: TopicLogSyncEvent::SyncStarted { .. },
+                        event: TopicLogSyncEvent::LogsResolved { .. },
                         ..
                     }
                 ),
@@ -680,7 +730,7 @@ mod tests {
                     event,
                     FromSync {
                         session_id: 0,
-                        event: TopicLogSyncEvent::OperationReceived { .. },
+                        event: TopicLogSyncEvent::SyncStarted { .. },
                         ..
                     }
                 ),
@@ -688,18 +738,26 @@ mod tests {
                     event,
                     FromSync {
                         session_id: 0,
-                        event: TopicLogSyncEvent::SyncFinished { .. },
+                        event: TopicLogSyncEvent::OperationReceived { .. },
                         ..
                     }
                 ),
                 3 => std::assert_matches!(
                     event,
                     FromSync {
-                        event: TopicLogSyncEvent::LiveModeStarted,
+                        session_id: 0,
+                        event: TopicLogSyncEvent::SyncFinished { .. },
                         ..
                     }
                 ),
                 4 => std::assert_matches!(
+                    event,
+                    FromSync {
+                        event: TopicLogSyncEvent::LiveModeStarted,
+                        ..
+                    }
+                ),
+                5 => std::assert_matches!(
                     event,
                     FromSync {
                         session_id: 0,
@@ -707,7 +765,7 @@ mod tests {
                         ..
                     }
                 ),
-                5 => std::assert_matches!(
+                6 => std::assert_matches!(
                     event,
                     FromSync {
                         event: TopicLogSyncEvent::SessionFinished { .. },
@@ -717,5 +775,42 @@ mod tests {
                 _ => panic!(),
             }
         }
+    }
+
+    /// square-tower fork addition (D3-u, M4-21): `Manager::resolved_logs` must return exactly
+    /// what `TopicStore::resolve` would for the same topic -- `TopicSyncManager`'s implementation
+    /// just delegates, but this closes the loop against the store directly rather than trusting
+    /// the delegation.
+    ///
+    /// Mutation-proof: hardcoding `resolved_logs` to ignore its `topic` argument (e.g. always
+    /// resolving some fixed topic) makes the equality assertion below fail once a second,
+    /// differently-associated topic is checked.
+    #[tokio::test]
+    async fn resolved_logs_matches_store_resolve() {
+        let mut peer = Peer::new(0).await;
+        let topic_a = Topic::random();
+        let topic_b = Topic::random();
+
+        let logs_a = BTreeMap::from([(peer.id(), vec![0 as TestLogId])]);
+        peer.associate(&topic_a, &logs_a).await;
+
+        let logs_b = BTreeMap::from([(peer.id(), vec![1 as TestLogId, 2])]);
+        peer.associate(&topic_b, &logs_b).await;
+
+        let manager = TestTopicSyncManager::new(peer.store.clone());
+
+        let via_manager_a = manager.resolved_logs(&topic_a).await;
+        let via_store_a = peer.store.resolve(&topic_a).await.unwrap();
+        assert_eq!(via_manager_a, via_store_a);
+        assert_eq!(via_manager_a, logs_a);
+
+        let via_manager_b = manager.resolved_logs(&topic_b).await;
+        let via_store_b = peer.store.resolve(&topic_b).await.unwrap();
+        assert_eq!(via_manager_b, via_store_b);
+        assert_eq!(via_manager_b, logs_b);
+
+        // A topic with no associations resolves to an empty map via both paths.
+        let topic_c = Topic::random();
+        assert_eq!(manager.resolved_logs(&topic_c).await, BTreeMap::new());
     }
 }

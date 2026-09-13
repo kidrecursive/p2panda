@@ -108,7 +108,7 @@ pub(crate) async fn processed_stream<M>(
     node_id: VerifyingKey,
     topic: Topic,
     ack_policy: AckPolicy,
-    sync_handle: SyncHandle<Operation, TopicLogSyncEvent<Extensions>>,
+    sync_handle: SyncHandle<Operation, TopicLogSyncEvent<Topic, Extensions>>,
     store: SqliteStore,
     forge: OperationForge,
     pipeline: Pipeline,
@@ -451,7 +451,7 @@ pub(crate) async fn process_operation_in(
     source: Source,
     topic: Topic,
     pipeline: &Pipeline,
-    sync_handle: &Arc<SyncHandle<Operation, TopicLogSyncEvent<Extensions>>>,
+    sync_handle: &Arc<SyncHandle<Operation, TopicLogSyncEvent<Topic, Extensions>>>,
 ) -> Event {
     let log_id = operation.header.extensions.log_id();
     let prune_flag = operation.header.extensions.prune_flag();

@@ -9,7 +9,7 @@ use sqlx::migrate::{MigrateDatabase, Migrator};
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::{Sqlite, migrate};
 use thiserror::Error;
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, broadcast};
 use tracing::{error, warn};
 
 /// Creates the SQLite database if it doesn't already exist.
@@ -247,11 +247,18 @@ pub struct SqliteStore {
     tx: Arc<Mutex<Option<Transaction<'static>>>>,
     pub(crate) pool: sqlx::SqlitePool,
     semaphore: Arc<Semaphore>,
+    /// square-tower fork addition (D3-u, M4-21): notifies of every *new* topic/author/data_id
+    /// association (`TopicStore::associate`'s `is_new` case), encoded-topic-bytes as the payload,
+    /// so `subscribe_new_associations` can filter to a single topic. This is the sole real
+    /// association choke point in the store -- used by `p2panda-net`'s topic manager to detect
+    /// structural drift for event-driven resync, without waiting for the periodic resync timer.
+    pub(crate) assoc_tx: broadcast::Sender<Vec<u8>>,
 }
 
 impl SqliteStore {
     /// Creates a new `SqliteStore` using the provided connection pool.
     pub(crate) fn new(pool: sqlx::SqlitePool) -> Self {
+        let (assoc_tx, _) = broadcast::channel(64);
         Self {
             tx: Arc::default(),
             pool,
@@ -259,6 +266,7 @@ impl SqliteStore {
             // what sqlx and SQLite do under the hood, but we want to make this behaviour explicit
             // right from the beginning with this semaphore.
             semaphore: Arc::new(Semaphore::new(1)),
+            assoc_tx,
         }
     }
 

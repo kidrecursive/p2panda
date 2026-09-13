@@ -195,5 +195,5 @@ pub enum NetworkError {
     Gossip(#[from] GossipError),
 
     #[error(transparent)]
-    LogSync(#[from] LogSyncError<Extensions>),
+    LogSync(#[from] LogSyncError<Topic, Extensions>),
 }

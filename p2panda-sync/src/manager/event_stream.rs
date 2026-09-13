@@ -9,7 +9,7 @@ use futures_channel::mpsc;
 use futures_util::sink::SinkExt;
 use futures_util::stream::{SelectAll, Stream, StreamExt};
 use p2panda_core::traits::Digest;
-use p2panda_core::{Extensions, Hash};
+use p2panda_core::{Extensions, Hash, LogId};
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tracing::{debug, trace};
@@ -24,21 +24,22 @@ pub(crate) trait StreamDebug<Item>: Stream<Item = Item> + Send + Debug + 'static
 impl<T, Item> StreamDebug<Item> for T where T: Stream<Item = Item> + Send + Debug + 'static {}
 
 #[allow(clippy::type_complexity)]
-pub(crate) struct ManagerEventStreamState<T, E>
+pub(crate) struct ManagerEventStreamState<T, L, E>
 where
     T: Clone + Eq + StdHash + Send + 'static,
+    L: LogId + Send + 'static,
     E: Extensions + Send + 'static,
 {
-    pub(crate) manager_rx: mpsc::Receiver<SessionStream<T, E>>,
+    pub(crate) manager_rx: mpsc::Receiver<SessionStream<T, L, E>>,
     pub(crate) session_rx_set:
-        SelectAll<Pin<Box<dyn StreamDebug<Option<FromSync<TopicLogSyncEvent<E>>>>>>>,
+        SelectAll<Pin<Box<dyn StreamDebug<Option<FromSync<TopicLogSyncEvent<L, E>>>>>>>,
     pub(crate) session_topic_map: SessionTopicMap<T, mpsc::Sender<ToTopicSync<E>>>,
     pub(crate) dedup: DeduplicationBuffer<Hash>,
 }
 
-type FutureOutput<T, E> = (
-    ManagerEventStreamState<T, E>,
-    Option<FromSync<TopicLogSyncEvent<E>>>,
+type FutureOutput<T, L, E> = (
+    ManagerEventStreamState<T, L, E>,
+    Option<FromSync<TopicLogSyncEvent<L, E>>>,
 );
 
 /// Event stream for a manager returned from SyncManager::subscribe().
@@ -47,28 +48,30 @@ type FutureOutput<T, E> = (
 /// (combined events of all running sync sessions). If the event contains an operation then it
 /// will be forwarded on to any concurrently running sync sessions.
 #[allow(clippy::type_complexity)]
-pub struct ManagerEventStream<T, E>
+pub struct ManagerEventStream<T, L, E>
 where
     T: Clone + Eq + StdHash + Send + 'static,
+    L: LogId + Send + 'static,
     E: Extensions + Send + 'static,
 {
     /// Stream state.
-    pub(crate) state: Option<ManagerEventStreamState<T, E>>,
+    pub(crate) state: Option<ManagerEventStreamState<T, L, E>>,
 
     /// The current future being polled.
-    pub(crate) pending: Option<Pin<Box<dyn Future<Output = FutureOutput<T, E>> + Send>>>,
+    pub(crate) pending: Option<Pin<Box<dyn Future<Output = FutureOutput<T, L, E>> + Send>>>,
 }
 
-impl<T, E> ManagerEventStream<T, E>
+impl<T, L, E> ManagerEventStream<T, L, E>
 where
     T: Clone + Debug + Eq + StdHash + Send + 'static,
+    L: LogId + Send + 'static,
     E: Extensions + Send + 'static,
 {
     async fn next_event(
-        mut state: ManagerEventStreamState<T, E>,
+        mut state: ManagerEventStreamState<T, L, E>,
     ) -> (
-        ManagerEventStreamState<T, E>,
-        Option<FromSync<TopicLogSyncEvent<E>>>,
+        ManagerEventStreamState<T, L, E>,
+        Option<FromSync<TopicLogSyncEvent<L, E>>>,
     ) {
         loop {
             tokio::select!(
@@ -86,7 +89,7 @@ where
 
                     let stream =
                         Box::pin(stream.map(Box::new(
-                            move |event: Result<TopicLogSyncEvent<E>, BroadcastStreamRecvError>| {
+                            move |event: Result<TopicLogSyncEvent<L, E>, BroadcastStreamRecvError>| {
                                 event.ok().map(|event| FromSync {
                                     session_id,
                                     remote: manager_event.remote,
@@ -153,19 +156,21 @@ where
     }
 }
 
-impl<T, E> Unpin for ManagerEventStream<T, E>
+impl<T, L, E> Unpin for ManagerEventStream<T, L, E>
 where
     T: Clone + Debug + Eq + StdHash + Send + 'static,
+    L: LogId + Send + 'static,
     E: Extensions + Send + 'static,
 {
 }
 
-impl<T, E> Stream for ManagerEventStream<T, E>
+impl<T, L, E> Stream for ManagerEventStream<T, L, E>
 where
     T: Clone + Debug + Eq + StdHash + Send + 'static,
+    L: LogId + Send + 'static,
     E: Extensions + Send + 'static,
 {
-    type Item = FromSync<TopicLogSyncEvent<E>>;
+    type Item = FromSync<TopicLogSyncEvent<L, E>>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if self.pending.is_none() {

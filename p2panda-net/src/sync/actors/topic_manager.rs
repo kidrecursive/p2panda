@@ -8,16 +8,16 @@
 //!
 //! A separate topic manager actor is spawned by the sync manager for each topic of interest.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error as StdError;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use futures_util::{Sink, SinkExt};
+use futures_util::{Sink, SinkExt, StreamExt};
 use iroh::endpoint::Connection;
-use p2panda_core::Topic;
+use p2panda_core::{Topic, VerifyingKey};
 use p2panda_sync::manager::SessionTopicMap;
 use p2panda_sync::traits::Manager as SyncManagerTrait;
 use p2panda_sync::{FromSync, SessionConfig, ToSync};
@@ -42,6 +42,14 @@ type SessionSink<M> = Pin<
                 ToSync<<M as SyncManagerTrait<Topic>>::Message>,
                 Error = <M as SyncManagerTrait<Topic>>::Error,
             >,
+    >,
+>;
+
+/// square-tower fork addition (D3-u, M4-21): per-session resolved-log baseline snapshots, shared
+/// with the background listener task spawned in `pre_start` (see `TopicManagerState::session_logs`).
+type SessionLogs<M> = Arc<
+    Mutex<
+        HashMap<SyncSessionId, BTreeMap<VerifyingKey, Vec<<M as SyncManagerTrait<Topic>>::LogId>>>,
     >,
 >;
 
@@ -91,6 +99,12 @@ pub enum ToTopicManager<T> {
         topic: Topic,
         live_mode: bool,
     },
+
+    /// square-tower fork addition (D3-u, M4-21): a new association was pushed for this topic
+    /// (`TopicStore::associate`'s `is_new` case, via `Manager::subscribe_new_associations`).
+    /// Triggers an immediate structural resync check against every currently active peer, instead
+    /// of waiting for the next `sync.resync_interval` tick.
+    AssociationChanged,
 }
 
 pub struct TopicManagerState<M>
@@ -133,6 +147,14 @@ where
     /// change in the window between that check and the old session's actual termination. Cloned
     /// from the same `ConnectionAuthoriser` the owning `SyncManager` holds (passed in at spawn).
     connection_authoriser: ConnectionAuthoriser,
+
+    /// square-tower fork addition (D3-u, M4-21): per-session resolved-log baseline snapshot, as
+    /// reported by that session's own `Manager::resolved_logs_from_event` (the fork's
+    /// `LogsResolved` event). Populated by the same background task that already tracks
+    /// `session_catch_up` (same broadcast channel, additional match arm) -- not a new event
+    /// source. A session missing from this map has not yet resolved its baseline and is treated
+    /// as "not stale" (deferred to the next check) by the `Resync` handler.
+    session_logs: SessionLogs<M>,
 }
 
 #[derive(Debug)]
@@ -151,6 +173,7 @@ impl<M> Default for TopicManager<M> {
 impl<M> ThreadLocalActor for TopicManager<M>
 where
     M: SyncManagerTrait<Topic> + Send + 'static,
+    M::LogId: Send + Sync + 'static,
 {
     type State = TopicManagerState<M>;
 
@@ -181,9 +204,16 @@ where
         // we can track, per session id, whether `Manager::is_catch_up_finished` has fired -- this
         // reads events already flowing through the actor, it does not add a new event source.
         let session_catch_up = Arc::new(Mutex::new(HashMap::<SyncSessionId, bool>::new()));
+        // square-tower fork addition (D3-u, M4-21): per-session resolved-log baseline, populated
+        // by the same listener below (additional match arm, no new event source).
+        let session_logs = Arc::new(Mutex::new(HashMap::<
+            SyncSessionId,
+            BTreeMap<VerifyingKey, Vec<M::LogId>>,
+        >::new()));
         {
             let mut event_rx = sender.subscribe();
             let session_catch_up = session_catch_up.clone();
+            let session_logs = session_logs.clone();
             tokio::spawn(async move {
                 loop {
                     match event_rx.recv().await {
@@ -194,9 +224,35 @@ where
                                     .expect("session_catch_up mutex poisoned")
                                     .insert(event.session_id, true);
                             }
+                            if let Some(logs) = M::resolved_logs_from_event(&event.event) {
+                                session_logs
+                                    .lock()
+                                    .expect("session_logs mutex poisoned")
+                                    .insert(event.session_id, logs);
+                            }
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+        }
+
+        // square-tower fork addition (D3-u, M4-21): push notification for new associations on
+        // this topic (`Manager::subscribe_new_associations`, itself delegating to
+        // `TopicStore::associate`'s sole real association choke point) -- posts `AssociationChanged`
+        // to trigger an immediate structural resync check, instead of waiting for the periodic
+        // `sync.resync_interval` tick (which remains as a bounded fallback).
+        {
+            let myself = myself.clone();
+            let mut new_associations = manager.subscribe_new_associations(&topic);
+            tokio::spawn(async move {
+                while new_associations.next().await.is_some() {
+                    if myself
+                        .send_message(ToTopicManager::AssociationChanged)
+                        .is_err()
+                    {
+                        break;
                     }
                 }
             });
@@ -223,6 +279,7 @@ where
             session_catch_up,
             pending_resync: HashMap::new(),
             connection_authoriser,
+            session_logs,
         })
     }
 
@@ -566,6 +623,39 @@ where
                     return Ok(());
                 }
 
+                // square-tower fork addition (D3-u, M4-21): event-driven, structurally-gated
+                // resync -- replace a session only when the topic's actual resolved (author, log)
+                // set differs from what that session resolved at its own start (its `LogsResolved`
+                // baseline). A session missing from `session_logs` has not yet resolved its
+                // baseline and is treated as "not stale" (deferred to the next tick/association),
+                // not as drifted.
+                let fresh = state.manager.resolved_logs(&topic).await;
+                let stale: Vec<SyncSessionId> = {
+                    let session_logs = state
+                        .session_logs
+                        .lock()
+                        .expect("session_logs mutex poisoned");
+                    current_sessions
+                        .iter()
+                        .filter(|id| {
+                            session_logs
+                                .get(id)
+                                .is_some_and(|baseline| baseline != &fresh)
+                        })
+                        .copied()
+                        .collect()
+                };
+
+                if stale.is_empty() {
+                    debug!(
+                        node_id = %state.endpoint.node_id().fmt_short(),
+                        remote_node_id = %node_id.fmt_short(),
+                        topic = %topic.fmt_short(),
+                        "skip resync: log set unchanged"
+                    );
+                    return Ok(());
+                }
+
                 info!(
                     node_id = %state.endpoint.node_id().fmt_short(),
                     remote_node_id = %node_id.fmt_short(),
@@ -575,10 +665,23 @@ where
                 );
                 state.pending_resync.insert(node_id, live_mode);
 
-                for id in &current_sessions {
+                for id in &stale {
                     if let Some(handle) = state.session_topic_map.sender_mut(*id) {
                         let _ = handle.send(ToSync::Close).await;
                     }
+                }
+            }
+            ToTopicManager::AssociationChanged => {
+                // square-tower fork addition (D3-u, M4-21): a new association was pushed for this
+                // topic -- check every currently active peer for structural drift right away,
+                // instead of waiting for the next `sync.resync_interval` tick. `Resync`'s own
+                // structural check (above) still gates whether anything is actually replaced.
+                for node_id in state.active_sync_set.iter().copied().collect::<Vec<_>>() {
+                    myself.send_message(ToTopicManager::Resync {
+                        node_id,
+                        topic: state.topic,
+                        live_mode: true,
+                    })?;
                 }
             }
         }
@@ -620,6 +723,11 @@ where
                             .session_catch_up
                             .lock()
                             .expect("session_catch_up mutex poisoned")
+                            .remove(&session_id);
+                        state
+                            .session_logs
+                            .lock()
+                            .expect("session_logs mutex poisoned")
                             .remove(&session_id);
 
                         if let Some(node_id) = owner
@@ -675,6 +783,11 @@ where
                                 .lock()
                                 .expect("session_catch_up mutex poisoned")
                                 .remove(&session_id);
+                            state
+                                .session_logs
+                                .lock()
+                                .expect("session_logs mutex poisoned")
+                                .remove(&session_id);
                             return Ok(());
                         };
 
@@ -684,6 +797,11 @@ where
                             .session_catch_up
                             .lock()
                             .expect("session_catch_up mutex poisoned")
+                            .remove(&session_id);
+                        state
+                            .session_logs
+                            .lock()
+                            .expect("session_logs mutex poisoned")
                             .remove(&session_id);
 
                         // square-tower fork addition (D3-s): a resync replacement's `Close` can
@@ -748,6 +866,7 @@ impl<M> TopicManager<M>
 where
     M: SyncManagerTrait<Topic> + Send + 'static,
     <M as SyncManagerTrait<Topic>>::Error: StdError + Send + Sync + 'static,
+    M::LogId: Send + Sync + 'static,
 {
     /// Initiate a session and update related manager state mappings.
     async fn new_session(
