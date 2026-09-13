@@ -36,6 +36,12 @@ use crate::{NodeId, ProtocolId};
 
 const RETRY_RATE: Duration = Duration::from_secs(5);
 
+/// square-tower fork addition (D3-u fix, M4-21): quiet gap used to coalesce a burst of
+/// associations for the same topic into a single `AssociationChanged` (see its send site's doc
+/// comment). Short enough that recovery from a genuinely isolated association is still much
+/// faster than `sync.resync_interval`'s 30s default.
+const ASSOCIATION_DEBOUNCE: Duration = Duration::from_millis(300);
+
 type SessionSink<M> = Pin<
     Box<
         dyn Sink<
@@ -253,11 +259,30 @@ where
         // `TopicStore::associate`'s sole real association choke point) -- posts `AssociationChanged`
         // to trigger an immediate structural resync check, instead of waiting for the periodic
         // `sync.resync_interval` tick (which remains as a bounded fallback).
+        //
+        // square-tower fork addition (D3-u fix, M4-21): debounced -- several associations landing
+        // in a tight burst (e.g. a space's admission sequentially associating a new member's
+        // group log, then their member log) are coalesced into exactly one `AssociationChanged`
+        // per quiet gap of `ASSOCIATION_DEBOUNCE`, not one per association. Without this, a
+        // session that has just reached "caught up" (and so becomes eligible for replacement) can
+        // be closed and reopened once per association in the same burst before any of those
+        // replacements ever gets far enough to be useful, each restart paying a full QUIC
+        // handshake + catch-up round trip -- observed as a real peer receiving zero operations
+        // for several seconds on a loaded CI runner
+        // (`association_burst_coalesces_into_one_replacement` reproduces this deterministically).
         {
             let myself = myself.clone();
             let mut new_associations = manager.subscribe_new_associations(&topic);
             tokio::spawn(async move {
-                while new_associations.next().await.is_some() {
+                loop {
+                    if new_associations.next().await.is_none() {
+                        break;
+                    }
+                    // Drain (without acting on) any further items arriving within the debounce
+                    // window, coalescing the whole burst into the one notification below.
+                    while let Ok(Some(())) =
+                        tokio::time::timeout(ASSOCIATION_DEBOUNCE, new_associations.next()).await
+                    {}
                     if myself
                         .send_message(ToTopicManager::AssociationChanged)
                         .is_err()

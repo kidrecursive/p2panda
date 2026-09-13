@@ -765,3 +765,94 @@ async fn resync_timer_noop_when_unchanged() {
         "an unchanged log set must not be replaced, but got: {no_replacement:?}"
     );
 }
+
+/// square-tower fork addition (D3-u fix, M4-21): several associations landing in a tight burst
+/// (e.g. a space's admission sequentially associating a new member's group log, then their
+/// member log) must be coalesced into exactly one session replacement, not one per association --
+/// see `ASSOCIATION_DEBOUNCE`'s doc comment (`p2panda-net/src/sync/actors/topic_manager.rs`) for
+/// why: an un-debounced burst can close and reopen a session repeatedly before any replacement
+/// gets far enough to be useful.
+///
+/// Mutation-proof: removing the debounce (posting `AssociationChanged` on every item instead of
+/// coalescing a burst) makes bob's session get replaced more than once for this single burst,
+/// failing the "at most one new session" assertion below.
+#[tokio::test]
+async fn association_burst_coalesces_into_one_replacement() {
+    setup_logging();
+
+    let topic: Topic = [93; 32].into();
+    let existing_log_id = 0;
+
+    let mut bob = TestNode::spawn([87; 32], None).await;
+    let mut alice = TestNode::spawn([88; 32], Some(bob.node_info())).await;
+
+    alice
+        .client
+        .create_operation(b"alice's first log", existing_log_id)
+        .await;
+    alice
+        .client
+        .associate(
+            &topic,
+            &HashMap::from([(alice.client_id(), vec![existing_log_id])]),
+        )
+        .await;
+
+    let alice_handle = alice.log_sync.stream(topic, true).await.unwrap();
+    let mut alice_subscription = alice_handle.subscribe().await.unwrap();
+
+    let bob_handle = bob.log_sync.stream(topic, true).await.unwrap();
+    let _bob_subscription = bob_handle.subscribe().await.unwrap();
+
+    alice_handle.initiate_session(bob.node_id());
+
+    let bob_session_id = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let event = alice_subscription.next().await.unwrap().unwrap();
+            if event.session_id == 0 && matches!(event.event, Event::LiveModeStarted) {
+                return event.session_id;
+            }
+        }
+    })
+    .await
+    .expect("bob's first session should reach live mode");
+
+    // A burst of new logs associated back-to-back, with no delay between them -- must be
+    // coalesced into exactly one replacement.
+    for (index, new_log_id) in [1u64, 2, 3].into_iter().enumerate() {
+        alice
+            .client
+            .create_operation(format!("alice's new log {index}").as_bytes(), new_log_id)
+            .await;
+        alice
+            .client
+            .associate(
+                &topic,
+                &HashMap::from([(alice.client_id(), vec![new_log_id])]),
+            )
+            .await;
+    }
+
+    // Collect every new (i.e. not bob's original) session id that appears on a generous window
+    // -- long enough for at least one replacement to fully settle (reach live mode again), short
+    // enough that a second, un-debounced replacement racing in would also be caught.
+    let mut new_session_ids = std::collections::HashSet::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let event = alice_subscription.next().await.unwrap().unwrap();
+            if event.session_id != bob_session_id
+                && matches!(event.event, Event::SyncStarted { .. })
+            {
+                new_session_ids.insert(event.session_id);
+            }
+        }
+    })
+    .await;
+
+    assert_eq!(
+        new_session_ids.len(),
+        1,
+        "a burst of associations must replace bob's session exactly once, not {}: {new_session_ids:?}",
+        new_session_ids.len()
+    );
+}
