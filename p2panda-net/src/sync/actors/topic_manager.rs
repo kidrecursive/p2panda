@@ -130,15 +130,25 @@ where
     /// seen catch-up finish yet" the same as "still in catch-up".
     session_catch_up: Arc<Mutex<HashMap<SyncSessionId, bool>>>,
 
-    /// square-tower fork addition (D3-s): node ids whose live session is currently being closed as
-    /// part of an in-progress resync replacement, mapped to the `live_mode` the fresh session
-    /// should use once the old one has actually terminated (`ActorTerminated`/`ActorFailed`). A
-    /// second `Resync` for a node already in this map is a no-op (at most one replacement in
-    /// flight per (peer, topic) at a time). Cleared without re-initiating if the node leaves
-    /// `active_sync_set` (gossip `NeighbourDown`/`EndSync`, or `Close`/`CloseAll`) before the old
-    /// session actually terminates -- see the M4-16 review fix in `handle_supervisor_evt` and the
-    /// `Close`/`CloseAll` handlers below.
-    pending_resync: HashMap<NodeId, bool>,
+    /// square-tower fork addition (D3-s): node ids whose live session(s) are currently being
+    /// closed as part of an in-progress resync replacement, mapped to the `live_mode` the fresh
+    /// session should use and the set of session ids we're still waiting to see actually
+    /// terminate. A second `Resync` for a node already in this map is a no-op (at most one
+    /// replacement in flight per (peer, topic) at a time). Cleared without re-initiating if the
+    /// node leaves `active_sync_set` (gossip `NeighbourDown`/`EndSync`, or `Close`/`CloseAll`)
+    /// before the old session(s) actually terminate -- see the M4-16 review fix in
+    /// `handle_supervisor_evt` and the `Close`/`CloseAll` handlers below.
+    ///
+    /// square-tower fork addition (D3-u, M4-21 fix): a peer can legitimately have more than one
+    /// concurrent session at resync time (D3-k's own dedupe comment documents the gossip race that
+    /// produces this); closing all of them and re-`Initiate`-ing on the *first* termination raced
+    /// `Initiate`'s "skip if another session for this node still runs" dedupe against the *other*
+    /// stale session not having terminated yet -- silently dropping the peer forever (found by
+    /// M4-21's own `Resync` firing immediately on the very first association, instead of D3-s's
+    /// 30s tick, which made this latent race fire deterministically on ordinary two-node sync
+    /// instead of only rarely). Fixed by waiting for every session named in the replacement to
+    /// terminate before resuming.
+    pending_resync: HashMap<NodeId, (bool, HashSet<SyncSessionId>)>,
 
     /// square-tower fork addition (D3-s, M4-16 review): used to re-run the identical
     /// `ConnectionAuthoriser` check `ToSyncManager::Resync`/`InitiateSync` already ran, at the
@@ -663,7 +673,9 @@ where
                     %live_mode,
                     "resync: replacing live session"
                 );
-                state.pending_resync.insert(node_id, live_mode);
+                state
+                    .pending_resync
+                    .insert(node_id, (live_mode, stale.iter().copied().collect()));
 
                 for id in &stale {
                     if let Some(handle) = state.session_topic_map.sender_mut(*id) {
@@ -731,7 +743,8 @@ where
                             .remove(&session_id);
 
                         if let Some(node_id) = owner
-                            && let Some(live_mode) = state.pending_resync.remove(&node_id)
+                            && let Some(live_mode) =
+                                Self::record_pending_resync_termination(state, node_id, session_id)
                         {
                             Self::resume_pending_resync(
                                 &myself,
@@ -810,7 +823,11 @@ where
                         // session is gone, so resume the pending replacement the same as the
                         // graceful path -- and skip the normal failure-retry timer, since we're
                         // already re-initiating immediately.
-                        if let Some(live_mode) = state.pending_resync.remove(&remote_node_id) {
+                        if let Some(live_mode) = Self::record_pending_resync_termination(
+                            state,
+                            remote_node_id,
+                            session_id,
+                        ) {
                             Self::resume_pending_resync(
                                 &myself,
                                 state,
@@ -905,6 +922,34 @@ where
         state.actor_session_id_map.insert(actor_id, session_id);
 
         (session_id, session)
+    }
+
+    /// square-tower fork addition (D3-u, M4-21 fix): records that `session_id` (one of possibly
+    /// several sessions closed for `node_id`'s pending resync replacement) has actually
+    /// terminated. Returns `Some(live_mode)` -- and removes the `pending_resync` entry -- only
+    /// once every session named in that replacement has terminated; otherwise returns `None` and
+    /// leaves the (now smaller) waiting set in place. Prevents re-`Initiate`-ing while a peer's
+    /// *other* concurrent session (the D3-k dedupe comment on `Initiate` documents how a peer can
+    /// legitimately end up with more than one) is still closing, which would otherwise make
+    /// `Initiate`'s own "skip if another session for this node still runs" dedupe silently drop
+    /// the peer forever (see `pending_resync`'s field doc comment).
+    fn record_pending_resync_termination(
+        state: &mut TopicManagerState<M>,
+        node_id: NodeId,
+        session_id: SyncSessionId,
+    ) -> Option<bool> {
+        let done = {
+            let (_, waiting) = state.pending_resync.get_mut(&node_id)?;
+            waiting.remove(&session_id);
+            waiting.is_empty()
+        };
+        done.then(|| {
+            state
+                .pending_resync
+                .remove(&node_id)
+                .expect("just checked")
+                .0
+        })
     }
 
     /// square-tower fork addition (D3-s, M4-16 review): called once the old session of a pending
